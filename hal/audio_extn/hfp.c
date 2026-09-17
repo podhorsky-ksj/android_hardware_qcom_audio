@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are
@@ -50,6 +50,9 @@ IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.*/
 #define AUDIO_PARAMETER_HFP_SET_SAMPLING_RATE "hfp_set_sampling_rate"
 #define AUDIO_PARAMETER_KEY_HFP_VOLUME "hfp_volume"
 #define AUDIO_PARAMETER_HFP_PCM_DEV_ID "hfp_pcm_dev_id"
+#define AUDIO_PARAMETER_HFP_VOL_MIXER_CTL "hfp_vol_mixer_ctl"
+#define AUDIO_PARAMETER_HFP_VALUE_MAX   128
+#define AUDIO_PARAMETER_HFP_FORCE_ROUTE_SPEAKER "hfp_route_spkr"
 
 #define AUDIO_PARAMETER_KEY_HFP_MIC_VOLUME "hfp_mic_volume"
 #define PLAYBACK_VOLUME_MAX 0x2000
@@ -66,7 +69,8 @@ IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.*/
       defined (PLATFORM_QCS605) || defined (PLATFORM_MSMNILE) || \
       defined (PLATFORM_KONA) || defined (PLATFORM_MSMSTEPPE) || \
       defined (PLATFORM_QCS405) || defined (PLATFORM_TRINKET) || \
-      defined (PLATFORM_LITO) || defined(PLATFORM_ATOLL)
+      defined (PLATFORM_LITO) || defined(PLATFORM_ATOLL) || \
+      defined (PLATFORM_BENGAL) || defined (PLATFORM_LAHAINA)
 #define HFP_RX_VOLUME     "SLIMBUS_7 LOOPBACK Volume"
 #else
 #define HFP_RX_VOLUME     "Internal HFP RX Volume"
@@ -84,6 +88,7 @@ struct hfp_module {
     struct pcm *hfp_pcm_tx;
     bool is_hfp_running;
     float hfp_volume;
+    char  hfp_vol_mixer_ctl[AUDIO_PARAMETER_HFP_VALUE_MAX];
     int32_t hfp_pcm_dev_id;
     audio_usecase_t ucid;
     float mic_volume;
@@ -97,6 +102,7 @@ static struct hfp_module hfpmod = {
     .hfp_pcm_tx = NULL,
     .is_hfp_running = 0,
     .hfp_volume = 0,
+    .hfp_vol_mixer_ctl = {0, },
     .hfp_pcm_dev_id = HFP_ASM_RX_TX,
     .ucid = USECASE_AUDIO_HFP_SCO,
     .mic_volume = CAPTURE_VOLUME_DEFAULT,
@@ -113,6 +119,7 @@ static struct pcm_config pcm_config_hfp = {
     .stop_threshold = INT_MAX,
     .avail_min = 0,
 };
+static bool route_spkr = false;
 
 //external feature dependency
 static fp_platform_set_mic_mute_t                   fp_platform_set_mic_mute;
@@ -125,6 +132,8 @@ static fp_get_usecase_from_list_t                   fp_get_usecase_from_list;
 static fp_disable_audio_route_t                     fp_disable_audio_route;
 static fp_disable_snd_device_t                      fp_disable_snd_device;
 static fp_voice_get_mic_mute_t                      fp_voice_get_mic_mute;
+static fp_audio_extn_auto_hal_start_hfp_downlink_t  fp_audio_extn_auto_hal_start_hfp_downlink;
+static fp_audio_extn_auto_hal_stop_hfp_downlink_t   fp_audio_extn_auto_hal_stop_hfp_downlink;
 
 static int32_t hfp_set_volume(struct audio_device *adev, float value)
 {
@@ -152,8 +161,13 @@ static int32_t hfp_set_volume(struct audio_device *adev, float value)
     }
 
     ALOGD("%s: Setting HFP volume to %d \n", __func__, vol);
-    ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
-    if (!ctl) {
+
+    if (0 == hfpmod.hfp_vol_mixer_ctl[0])
+        ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
+    else
+        ctl = mixer_get_ctl_by_name(adev->mixer, hfpmod.hfp_vol_mixer_ctl);
+
+    if(!ctl) {
         ALOGE("%s: Could not get ctl for mixer cmd - %s",
               __func__, mixer_ctl_name);
         return -EINVAL;
@@ -303,9 +317,15 @@ static int32_t start_hfp(struct audio_device *adev,
     uc_info->id = hfpmod.ucid;
     uc_info->type = PCM_HFP_CALL;
     uc_info->stream.out = adev->primary_output;
-    uc_info->devices = adev->primary_output->devices;
+    list_init(&uc_info->device_list);
+    assign_devices(&uc_info->device_list, &adev->primary_output->device_list);
     uc_info->in_snd_device = SND_DEVICE_NONE;
     uc_info->out_snd_device = SND_DEVICE_NONE;
+
+    if (route_spkr) {
+        reassign_device_list(&uc_info->device_list, AUDIO_DEVICE_OUT_SPEAKER, "");
+        reassign_device_list(&uc_info->stream.out->device_list, AUDIO_DEVICE_OUT_SPEAKER, "");
+    }
 
     list_add_tail(&adev->usecase_list, &uc_info->list);
 
@@ -332,29 +352,11 @@ static int32_t start_hfp(struct audio_device *adev,
     ALOGD("%s: HFP PCM devices (rx: %d tx: %d pcm dev id: %d) usecase(%d)",
               __func__, pcm_dev_rx_id, pcm_dev_tx_id, hfpmod.hfp_pcm_dev_id, uc_info->id);
 
-    hfpmod.hfp_sco_rx = pcm_open(adev->snd_card,
-                                  pcm_dev_asm_rx_id,
-                                  PCM_OUT, &pcm_config_hfp);
-    if (hfpmod.hfp_sco_rx && !pcm_is_ready(hfpmod.hfp_sco_rx)) {
-        ALOGE("%s: %s", __func__, pcm_get_error(hfpmod.hfp_sco_rx));
-        ret = -EIO;
-        goto exit;
-    }
-
     hfpmod.hfp_pcm_rx = pcm_open(adev->snd_card,
                                  pcm_dev_rx_id,
                                  PCM_OUT, &pcm_config_hfp);
     if (hfpmod.hfp_pcm_rx && !pcm_is_ready(hfpmod.hfp_pcm_rx)) {
         ALOGE("%s: %s", __func__, pcm_get_error(hfpmod.hfp_pcm_rx));
-        ret = -EIO;
-        goto exit;
-    }
-
-    hfpmod.hfp_sco_tx = pcm_open(adev->snd_card,
-                                  pcm_dev_asm_tx_id,
-                                  PCM_IN, &pcm_config_hfp);
-    if (hfpmod.hfp_sco_tx && !pcm_is_ready(hfpmod.hfp_sco_tx)) {
-        ALOGE("%s: %s", __func__, pcm_get_error(hfpmod.hfp_sco_tx));
         ret = -EIO;
         goto exit;
     }
@@ -368,17 +370,6 @@ static int32_t start_hfp(struct audio_device *adev,
         goto exit;
     }
 
-    if (pcm_start(hfpmod.hfp_sco_rx) < 0) {
-        ALOGE("%s: pcm start for hfp sco rx failed", __func__);
-        ret = -EINVAL;
-        goto exit;
-    }
-    if (pcm_start(hfpmod.hfp_sco_tx) < 0) {
-        ALOGE("%s: pcm start for hfp sco tx failed", __func__);
-        ret = -EINVAL;
-        goto exit;
-    }
-
     if (pcm_start(hfpmod.hfp_pcm_rx) < 0) {
         ALOGE("%s: pcm start for hfp pcm rx failed", __func__);
         ret = -EINVAL;
@@ -386,6 +377,38 @@ static int32_t start_hfp(struct audio_device *adev,
     }
     if (pcm_start(hfpmod.hfp_pcm_tx) < 0) {
         ALOGE("%s: pcm start for hfp pcm tx failed", __func__);
+        ret = -EINVAL;
+        goto exit;
+    }
+
+    if (fp_audio_extn_auto_hal_start_hfp_downlink(adev, uc_info))
+        ALOGE("%s: start hfp downlink failed", __func__);
+
+    hfpmod.hfp_sco_rx = pcm_open(adev->snd_card,
+                                  pcm_dev_asm_rx_id,
+                                  PCM_OUT, &pcm_config_hfp);
+    if (hfpmod.hfp_sco_rx && !pcm_is_ready(hfpmod.hfp_sco_rx)) {
+        ALOGE("%s: %s", __func__, pcm_get_error(hfpmod.hfp_sco_rx));
+        ret = -EIO;
+        goto exit;
+    }
+
+    hfpmod.hfp_sco_tx = pcm_open(adev->snd_card,
+                                  pcm_dev_asm_tx_id,
+                                  PCM_IN, &pcm_config_hfp);
+    if (hfpmod.hfp_sco_tx && !pcm_is_ready(hfpmod.hfp_sco_tx)) {
+        ALOGE("%s: %s", __func__, pcm_get_error(hfpmod.hfp_sco_tx));
+        ret = -EIO;
+        goto exit;
+    }
+
+    if (pcm_start(hfpmod.hfp_sco_rx) < 0) {
+        ALOGE("%s: pcm start for hfp sco rx failed", __func__);
+        ret = -EINVAL;
+        goto exit;
+    }
+    if (pcm_start(hfpmod.hfp_sco_tx) < 0) {
+        ALOGE("%s: pcm start for hfp sco tx failed", __func__);
         ret = -EINVAL;
         goto exit;
     }
@@ -410,9 +433,12 @@ static int32_t stop_hfp(struct audio_device *adev)
 {
     int32_t ret = 0;
     struct audio_usecase *uc_info;
+    struct listnode *node;
+    struct audio_device_info *item = NULL;
 
     ALOGD("%s: enter", __func__);
     hfpmod.is_hfp_running = false;
+    route_spkr = false;
 
     /* 1. Close the PCM devices */
     if (hfpmod.hfp_sco_rx) {
@@ -446,7 +472,7 @@ static int32_t stop_hfp(struct audio_device *adev)
     }
 
     /* 2. Disable echo reference while stopping hfp */
-    fp_platform_set_echo_reference(adev, false, uc_info->devices);
+    fp_platform_set_echo_reference(adev, false, &uc_info->device_list);
 
     /* 3. Get and set stream specific mixer controls */
     fp_disable_audio_route(adev, uc_info);
@@ -454,6 +480,9 @@ static int32_t stop_hfp(struct audio_device *adev)
     /* 4. Disable the rx and tx devices */
     fp_disable_snd_device(adev, uc_info->out_snd_device);
     fp_disable_snd_device(adev, uc_info->in_snd_device);
+
+    if (fp_audio_extn_auto_hal_stop_hfp_downlink(adev, uc_info))
+        ALOGE("%s: stop hfp downlink failed", __func__);
 
     /* Set the unmute Tx mixer control */
     if (fp_voice_get_mic_mute(adev)) {
@@ -483,6 +512,10 @@ void hfp_init(hfp_init_config_t init_config)
     fp_disable_audio_route = init_config.fp_disable_audio_route;
     fp_disable_snd_device = init_config.fp_disable_snd_device;
     fp_voice_get_mic_mute = init_config.fp_voice_get_mic_mute;
+    fp_audio_extn_auto_hal_start_hfp_downlink =
+                                init_config.fp_audio_extn_auto_hal_start_hfp_downlink;
+    fp_audio_extn_auto_hal_stop_hfp_downlink =
+                                init_config.fp_audio_extn_auto_hal_stop_hfp_downlink;
 }
 
 bool hfp_is_active(struct audio_device *adev)
@@ -528,8 +561,9 @@ void hfp_set_parameters(struct audio_device *adev, struct str_parms *parms)
     int val;
     float vol;
     char value[32]={0};
+    struct audio_usecase *uc_info = NULL;
 
-    ALOGD("%s: enter", __func__);
+    ALOGV("%s: enter", __func__);
 
     ret = str_parms_get_str(parms, AUDIO_PARAMETER_HFP_ENABLE, value,
                             sizeof(value));
@@ -556,15 +590,46 @@ void hfp_set_parameters(struct audio_device *adev, struct str_parms *parms)
                ALOGE("Unsupported rate..");
     }
 
-    if (hfpmod.is_hfp_running) {
-        memset(value, 0, sizeof(value));
-        ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING,
+    memset(value, 0, sizeof(value));
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_HFP_FORCE_ROUTE_SPEAKER, value,
+                            sizeof(value));
+    if(ret >= 0){
+        route_spkr = true;
+        ALOGD("%s: Set force route to speaker", __func__);
+    }
+
+    memset(value, 0, sizeof(value));
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING,
                                 value, sizeof(value));
-        if (ret >= 0) {
-            val = atoi(value);
-            if (val > 0)
-                fp_select_devices(adev, hfpmod.ucid);
+    if (ret >= 0) {
+        val = atoi(value);
+        if (val > 0) {
+            if (hfpmod.is_hfp_running) {
+                if (route_spkr) {
+                    if (val != AUDIO_DEVICE_OUT_SPEAKER)
+                        ALOGI("%s: HFP call in progress, cannot route to device %d", __func__, val);
+                } else {
+                    uc_info = fp_get_usecase_from_list(adev, hfpmod.ucid);
+
+                    if (uc_info != NULL) {
+                        reassign_device_list(&uc_info->device_list, val, "");
+                        reassign_device_list(&uc_info->stream.out->device_list, val, "");
+                        fp_select_devices(adev, hfpmod.ucid);
+                    }
+                }
+
+                str_parms_del(parms, AUDIO_PARAMETER_STREAM_ROUTING);
+            }
         }
+    }
+
+    memset(value, 0, sizeof(value));
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_HFP_VOL_MIXER_CTL,
+                           value, sizeof(value));
+    if (ret >= 0) {
+        ALOGD("%s: mixer ctl name: %s", __func__, value);
+        strlcpy(hfpmod.hfp_vol_mixer_ctl, value, sizeof(value));
+        str_parms_del(parms, AUDIO_PARAMETER_HFP_VOL_MIXER_CTL);
     }
 
     memset(value, 0, sizeof(value));

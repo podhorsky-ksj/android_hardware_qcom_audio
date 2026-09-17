@@ -3,13 +3,15 @@ cc_defaults {
 
     cflags: [
         "-Werror",
+        // The vendor kernel headers and Bionic both declare sched_param.
+        "-D_LINUX_SCHED_TYPES_H",
     ],
 
     include_dirs: [
         "external/tinyalsa/include",
         "external/tinycompress/include",
-        "hardware/qcom-caf/msm8998/audio/hal",
-        "hardware/qcom-caf/msm8998/audio/hal/msm8974",
+        "hardware/qcom-caf/sdm660/audio/hal",
+        "hardware/qcom-caf/sdm660/audio/hal/msm8974",
         "system/media/audio_route/include",
         "system/media/audio_utils/include",
     ],
@@ -23,6 +25,10 @@ cc_defaults {
         "libcutils",
         "liblog",
     ],
+
+    sanitize: {
+        integer_overflow: true,
+    },
 }
 
 cc_library_shared {
@@ -54,6 +60,7 @@ cc_library_shared {
 
     srcs: [
         "ssr.c",
+        "device_utils.c",
     ],
 
     cflags: [
@@ -125,6 +132,7 @@ cc_library_shared {
 
     srcs: [
         "a2dp.c",
+        "device_utils.c",
     ],
 
     shared_libs: [
@@ -149,6 +157,7 @@ cc_library_shared {
 
     srcs: [
         "hfp.c",
+        "device_utils.c",
     ],
 
     shared_libs: [
@@ -190,6 +199,7 @@ cc_library_shared {
 
     srcs: [
         "audiozoom.c",
+        "device_utils.c",
     ],
 
     include_dirs: [

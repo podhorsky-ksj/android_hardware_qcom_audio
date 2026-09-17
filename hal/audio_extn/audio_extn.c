@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2021, The Linux Foundation. All rights reserved.
  * Not a Contribution.
  *
  * Copyright (C) 2013 The Android Open Source Project
@@ -45,6 +45,7 @@
 #include <fcntl.h>
 #include <cutils/properties.h>
 #include <log/log.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <sched.h>
 
@@ -57,10 +58,18 @@
 #include "edid.h"
 #include "sound/compress_params.h"
 
+#ifdef AUDIO_GKI_ENABLED
+#include "sound/audio_compressed_formats.h"
+#endif
+
 #ifdef DYNAMIC_LOG_ENABLED
 #include <log_xml_parser.h>
 #define LOG_MASK HAL_MOD_FILE_AUDIO_EXTN
 #include <log_utils.h>
+#endif
+
+#ifdef LINUX_ENABLED
+#include "audio_stub.h"
 #endif
 
 #define MAX_SLEEP_RETRY 100
@@ -95,8 +104,9 @@ int keep_alive_set_parameters(struct audio_device *adev,
                                          struct str_parms *parms);
 
 bool cin_applicable_stream(struct stream_in *in);
-bool cin_attached_usecase(audio_usecase_t uc_id);
+bool cin_attached_usecase(struct stream_in *in);
 bool cin_format_supported(audio_format_t format);
+int cin_acquire_usecase(struct stream_in *in);
 size_t cin_get_buffer_size(struct stream_in *in);
 int cin_open_input_stream(struct stream_in *in);
 void cin_stop_input_stream(struct stream_in *in);
@@ -217,7 +227,9 @@ static bool audio_extn_hifi_filter_enabled = false;
 
 #define IS_BIT_SET(NUM, bitno) (NUM & (1 << bitno))
 
-#define EXT_DISPLAY_PLUG_STATUS_NOTIFY_ENABLE 0x30
+#define EXT_DISPLAY_PLUG_STATUS_NOTIFY_ENABLE      0x30
+#define EXT_DISPLAY_PLUG_STATUS_NOTIFY_CONNECT     0x01
+#define EXT_DISPLAY_PLUG_STATUS_NOTIFY_DISCONNECT  0x00
 
 static ssize_t update_sysfs_node(const char *path, const char *data, size_t len)
 {
@@ -277,12 +289,14 @@ static int get_ext_disp_sysfs_node_index(int ext_disp_type)
     return -1;
 }
 
-static int update_ext_disp_sysfs_node(const struct audio_device *adev, int node_value)
+static int update_ext_disp_sysfs_node(const struct audio_device *adev,
+                                      int node_value, int controller, int stream)
 {
     char ext_disp_ack_path[80] = {0};
     char ext_disp_ack_value[3] = {0};
     int index, ret = -1;
-    int ext_disp_type = platform_get_ext_disp_type(adev->platform);
+    int ext_disp_type = platform_get_ext_disp_type_v2(adev->platform, controller,
+                                                      stream);
 
     if (ext_disp_type < 0) {
         ALOGE("%s, Unable to get the external display type, err:%d",
@@ -306,26 +320,47 @@ static int update_ext_disp_sysfs_node(const struct audio_device *adev, int node_
     return ret;
 }
 
-static int update_audio_ack_state(const struct audio_device *adev, int node_value)
+static int update_audio_ack_state(const struct audio_device *adev,
+                                  int node_value,
+                                  int controller,
+                                  int stream)
 {
-    const char *mixer_ctl_name = "External Display Audio Ack";
-    struct mixer_ctl *ctl;
     int ret = 0;
+    int ctl_index = 0;
+    struct mixer_ctl *ctl = NULL;
+    const char *ctl_prefix = "External Display";
+    const char *ctl_suffix = "Audio Ack";
+    char mixer_ctl_name[MIXER_PATH_MAX_LENGTH] = {0};
 
+    ctl_index = platform_get_display_port_ctl_index(controller, stream);
+    if (-EINVAL == ctl_index) {
+        ALOGE("%s: Unknown controller/stream %d/%d",
+              __func__, controller, stream);
+        return -EINVAL;
+    }
+
+    if (0 == ctl_index)
+        snprintf(mixer_ctl_name, sizeof(mixer_ctl_name),
+                 "%s %s", ctl_prefix, ctl_suffix);
+    else
+        snprintf(mixer_ctl_name, sizeof(mixer_ctl_name),
+                 "%s%d %s", ctl_prefix, ctl_index, ctl_suffix);
+
+    ALOGV("%s: mixer ctl name: %s", __func__, mixer_ctl_name);
     ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
     /* If no mixer command support, fall back to sysfs node approach */
     if (!ctl) {
         ALOGI("%s: could not get ctl for mixer cmd(%s), use sysfs node instead\n",
               __func__, mixer_ctl_name);
-        ret = update_ext_disp_sysfs_node(adev, node_value);
+        ret = update_ext_disp_sysfs_node(adev, node_value, controller, stream);
     } else {
         char *ack_str = NULL;
 
         if (node_value == EXT_DISPLAY_PLUG_STATUS_NOTIFY_ENABLE)
             ack_str = "Ack_Enable";
-        else if (node_value == 1)
+        else if (node_value == EXT_DISPLAY_PLUG_STATUS_NOTIFY_CONNECT)
             ack_str = "Connect";
-        else if (node_value == 0)
+        else if (node_value == EXT_DISPLAY_PLUG_STATUS_NOTIFY_DISCONNECT)
             ack_str = "Disconnect";
         else {
             ALOGE("%s: Invalid input parameter - 0x%x\n",
@@ -344,24 +379,32 @@ static int update_audio_ack_state(const struct audio_device *adev, int node_valu
 static void audio_extn_ext_disp_set_parameters(const struct audio_device *adev,
                                                      struct str_parms *parms)
 {
+    int controller = 0;
+    int stream = 0;
     char value[32] = {0};
     static bool is_hdmi_sysfs_node_init = false;
 
     if (str_parms_get_str(parms, "connect", value, sizeof(value)) >= 0
             && (atoi(value) & AUDIO_DEVICE_OUT_AUX_DIGITAL)) {
         //params = "connect=1024" for external display connection.
+        platform_get_controller_stream_from_params(parms, &controller, &stream);
         if (is_hdmi_sysfs_node_init == false) {
             //check if this is different for dp and hdmi
             is_hdmi_sysfs_node_init = true;
-            update_audio_ack_state(adev, EXT_DISPLAY_PLUG_STATUS_NOTIFY_ENABLE);
+            update_audio_ack_state(adev,
+                                   EXT_DISPLAY_PLUG_STATUS_NOTIFY_ENABLE,
+                                   controller, stream);
         }
-        update_audio_ack_state(adev, 1);
+        update_audio_ack_state(adev, EXT_DISPLAY_PLUG_STATUS_NOTIFY_CONNECT,
+                               controller, stream);
     } else if(str_parms_get_str(parms, "disconnect", value, sizeof(value)) >= 0
             && (atoi(value) & AUDIO_DEVICE_OUT_AUX_DIGITAL)){
         //params = "disconnect=1024" for external display disconnection.
-        update_audio_ack_state(adev, 0);
+        platform_get_controller_stream_from_params(parms, &controller, &stream);
+        update_audio_ack_state(adev, EXT_DISPLAY_PLUG_STATUS_NOTIFY_DISCONNECT,
+                               controller, stream);
         ALOGV("invalidate cached edid");
-        platform_invalidate_hdmi_config(adev->platform);
+        platform_invalidate_hdmi_config_v2(adev->platform, controller, stream);
     } else {
         // handle ext disp devices only
         return;
@@ -1093,8 +1136,10 @@ void anc_headset_feature_init(bool is_feature_enabled)
 
 bool audio_extn_get_anc_enabled(void)
 {
-    ALOGD("%s: anc_enabled:%d", __func__, aextnmod.anc_enabled);
-    return (aextnmod.anc_enabled ? true: false);
+    ALOGD("%s: anc_enabled:%d", __func__,
+        (aextnmod.anc_enabled && audio_extn_anc_headset_feature_enabled));
+    return (aextnmod.anc_enabled &&
+        audio_extn_anc_headset_feature_enabled);
 }
 
 bool audio_extn_should_use_handset_anc(int in_channels)
@@ -1212,12 +1257,12 @@ void audio_extn_set_anc_parameters(struct audio_device *adev,
         list_for_each(node, &adev->usecase_list) {
             usecase = node_to_item(node, struct audio_usecase, list);
             if (usecase->stream.out && usecase->type != PCM_CAPTURE) {
-                if (usecase->stream.out->devices == \
-                    AUDIO_DEVICE_OUT_WIRED_HEADPHONE ||
-                    usecase->stream.out->devices ==  \
-                    AUDIO_DEVICE_OUT_WIRED_HEADSET ||
-                    usecase->stream.out->devices ==  \
-                    AUDIO_DEVICE_OUT_EARPIECE) {
+                if (is_single_device_type_equal(&usecase->stream.out->device_list,
+                                AUDIO_DEVICE_OUT_WIRED_HEADPHONE) ||
+                    is_single_device_type_equal(&usecase->stream.out->device_list,
+                                AUDIO_DEVICE_OUT_WIRED_HEADSET) ||
+                    is_single_device_type_equal(&usecase->stream.out->device_list,
+                                AUDIO_DEVICE_OUT_EARPIECE)) {
                         select_devices(adev, usecase->id);
                         ALOGV("%s: switching device completed", __func__);
                         break;
@@ -1253,6 +1298,12 @@ static int32_t afe_proxy_set_channel_mapping(struct audio_device *adev,
     case 2:
         set_values[0] = PCM_CHANNEL_FL;
         set_values[1] = PCM_CHANNEL_FR;
+        break;
+     case 4:
+        set_values[0] = PCM_CHANNEL_FL;
+        set_values[1] = PCM_CHANNEL_FR;
+        set_values[2] = PCM_CHANNEL_LS;
+        set_values[3] = PCM_CHANNEL_LFE;
         break;
     case 6:
         set_values[0] = PCM_CHANNEL_FL;
@@ -1350,7 +1401,7 @@ int32_t audio_extn_set_afe_proxy_channel_mixer(struct audio_device *adev,
     }
     mixer_ctl_set_enum_by_string(ctl, channel_cnt_str);
 
-    if (channel_count == 6 || channel_count == 8 || channel_count == 2) {
+    if (channel_count == 6 || channel_count == 8 || channel_count == 2 || channel_count == 4) {
         ret = afe_proxy_set_channel_mapping(adev, channel_count, snd_device);
     } else {
         ALOGE("%s: set unsupported channel count(%d)",  __func__, channel_count);
@@ -3001,6 +3052,449 @@ void audio_extn_init(struct audio_device *adev)
     audio_extn_aptx_dec_set_license(adev);
 }
 
+#ifdef AUDIO_GKI_ENABLED
+static int get_wma_dec_info(struct stream_out *out, struct str_parms *parms) {
+    int ret = 0;
+    char value[32];
+
+    struct snd_generic_dec_wma *wma_dec = NULL;
+
+    /* reserved[0] will contain the WMA decoder type */
+    if (out->format == AUDIO_FORMAT_WMA) {
+        out->compr_config.codec->options.generic.reserved[0] = AUDIO_COMP_FORMAT_WMA;
+    } else if (out->format == AUDIO_FORMAT_WMA_PRO) {
+        out->compr_config.codec->options.generic.reserved[0] = AUDIO_COMP_FORMAT_WMA_PRO;
+    } else {
+        ALOGE("%s: unknown WMA format 0x%x\n", __func__, out->format);
+        return -EINVAL;
+    }
+
+    /* reserved[1] onwards will contain the WMA decoder format info */
+    wma_dec = (struct snd_generic_dec_wma *)
+                &(out->compr_config.codec->options.generic.reserved[1]);
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_AVG_BIT_RATE,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        wma_dec->avg_bit_rate = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_BLOCK_ALIGN,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        wma_dec->super_block_align = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_BIT_PER_SAMPLE,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        wma_dec->bits_per_sample = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_CHANNEL_MASK,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        wma_dec->channelmask = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        wma_dec->encodeopt = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION1,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        wma_dec->encodeopt1 = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION2,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        wma_dec->encodeopt2 = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+
+    ALOGV("WMA params: fmt 0x%x, id 0x%x, WMA type 0x%x, bit rate 0x%x,"
+            " balgn 0x%x, sr %d, chmsk 0x%x"
+            " encop 0x%x, op1 0x%x, op2 0x%x \n",
+            out->compr_config.codec->format,
+            out->compr_config.codec->id,
+            out->compr_config.codec->options.generic.reserved[0],
+            wma_dec->avg_bit_rate,
+            wma_dec->super_block_align,
+            wma_dec->bits_per_sample,
+            wma_dec->channelmask,
+            wma_dec->encodeopt,
+            wma_dec->encodeopt1,
+            wma_dec->encodeopt2);
+
+    return ret;
+}
+#else
+int get_wma_info(struct stream_out *out, struct str_parms *parms) {
+    int ret = 0;
+    char value[32];
+
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_AVG_BIT_RATE, value, sizeof(value));
+    if (ret >= 0) {
+        out->compr_config.codec->options.wma.avg_bit_rate = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_BLOCK_ALIGN, value, sizeof(value));
+    if (ret >= 0) {
+        out->compr_config.codec->options.wma.super_block_align = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_BIT_PER_SAMPLE, value, sizeof(value));
+    if (ret >= 0) {
+        out->compr_config.codec->options.wma.bits_per_sample = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_CHANNEL_MASK, value, sizeof(value));
+    if (ret >= 0) {
+        out->compr_config.codec->options.wma.channelmask = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION, value, sizeof(value));
+    if (ret >= 0) {
+        out->compr_config.codec->options.wma.encodeopt = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION1, value, sizeof(value));
+    if (ret >= 0) {
+        out->compr_config.codec->options.wma.encodeopt1 = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION2, value, sizeof(value));
+    if (ret >= 0) {
+        out->compr_config.codec->options.wma.encodeopt2 = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ALOGV("WMA params: fmt %x, bit rate %x, balgn %x, sr %d, chmsk %x"
+            " encop %x, op1 %x, op2 %x",
+            out->compr_config.codec->format,
+            out->compr_config.codec->options.wma.avg_bit_rate,
+            out->compr_config.codec->options.wma.super_block_align,
+            out->compr_config.codec->options.wma.bits_per_sample,
+            out->compr_config.codec->options.wma.channelmask,
+            out->compr_config.codec->options.wma.encodeopt,
+            out->compr_config.codec->options.wma.encodeopt1,
+            out->compr_config.codec->options.wma.encodeopt2);
+
+    return ret;
+}
+#endif
+
+#ifdef AUDIO_GKI_ENABLED
+static int get_flac_dec_info(struct stream_out *out, struct str_parms *parms) {
+    int ret = 0;
+    char value[32];
+    struct snd_generic_dec_flac *flac_dec = NULL;
+
+    /* reserved[0] will contain the FLAC decoder type */
+    out->compr_config.codec->options.generic.reserved[0] =
+                                                AUDIO_COMP_FORMAT_FLAC;
+    /* reserved[1] onwards will contain the FLAC decoder format info */
+    flac_dec = (struct snd_generic_dec_flac *)
+                &(out->compr_config.codec->options.generic.reserved[1]);
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_FLAC_MIN_BLK_SIZE,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        flac_dec->min_blk_size = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_FLAC_MAX_BLK_SIZE,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        flac_dec->max_blk_size = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_FLAC_MIN_FRAME_SIZE,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        flac_dec->min_frame_size = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_FLAC_MAX_FRAME_SIZE,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        flac_dec->max_frame_size = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+
+    ALOGV("FLAC metadata: fmt 0x%x, id 0x%x, FLAC type 0x%x min_blk_size %d,"
+                "  max_blk_size %d min_frame_size %d max_frame_size %d \n",
+          out->compr_config.codec->format,
+          out->compr_config.codec->id,
+          out->compr_config.codec->options.generic.reserved[0],
+          flac_dec->min_blk_size,
+          flac_dec->max_blk_size,
+          flac_dec->min_frame_size,
+          flac_dec->max_frame_size);
+
+    return ret;
+}
+
+static int get_alac_dec_info(struct stream_out *out, struct str_parms *parms) {
+    int ret = 0;
+    char value[32];
+    struct snd_generic_dec_alac *alac_dec = NULL;
+
+    /* reserved[0] will contain the ALAC decoder type */
+    out->compr_config.codec->options.generic.reserved[0] =
+                                                AUDIO_COMP_FORMAT_ALAC;
+    /* reserved[1] onwards will contain the ALAC decoder format info */
+    alac_dec = (struct snd_generic_dec_alac *)
+                &(out->compr_config.codec->options.generic.reserved[1]);
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_FRAME_LENGTH,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->frame_length = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_COMPATIBLE_VERSION,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->compatible_version = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_BIT_DEPTH,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->bit_depth = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_PB,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->pb = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_MB,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->mb = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_KB,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->kb = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_NUM_CHANNELS,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->num_channels = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_MAX_RUN,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->max_run = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_MAX_FRAME_BYTES,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->max_frame_bytes = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_AVG_BIT_RATE,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->avg_bit_rate = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_SAMPLING_RATE,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->sample_rate = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_ALAC_CHANNEL_LAYOUT_TAG,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        alac_dec->channel_layout_tag = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+
+    ALOGV("ALAC CSD values: fmt 0x%x, id 0x%x, ALAC type 0x%x, frameLength %d"
+            "bitDepth %d numChannels %d"
+            " maxFrameBytes %d, avgBitRate %d, sampleRate %d \n",
+            out->compr_config.codec->format,
+            out->compr_config.codec->id,
+            out->compr_config.codec->options.generic.reserved[0],
+            alac_dec->frame_length,
+            alac_dec->bit_depth,
+            alac_dec->num_channels,
+            alac_dec->max_frame_bytes,
+            alac_dec->avg_bit_rate,
+            alac_dec->sample_rate);
+
+    return ret;
+}
+
+static int get_ape_dec_info(struct stream_out *out, struct str_parms *parms) {
+    int ret = 0;
+    char value[32];
+    struct snd_generic_dec_ape *ape_dec = NULL;
+
+    /* reserved[0] will contain the APE decoder type */
+    out->compr_config.codec->options.generic.reserved[0] =
+                                                        AUDIO_COMP_FORMAT_APE;
+
+    /* reserved[1] onwards will contain the APE decoder format info */
+    ape_dec = (struct snd_generic_dec_ape *)
+                &(out->compr_config.codec->options.generic.reserved[1]);
+
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_APE_COMPATIBLE_VERSION,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        ape_dec->compatible_version = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_APE_COMPRESSION_LEVEL,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        ape_dec->compression_level = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_APE_FORMAT_FLAGS,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        ape_dec->format_flags = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_APE_BLOCKS_PER_FRAME,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        ape_dec->blocks_per_frame = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_APE_FINAL_FRAME_BLOCKS,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        ape_dec->final_frame_blocks = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_APE_TOTAL_FRAMES, value,
+                                sizeof(value));
+    if (ret >= 0) {
+        ape_dec->total_frames = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_APE_BITS_PER_SAMPLE,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        ape_dec->bits_per_sample = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_APE_NUM_CHANNELS,
+                                 value, sizeof(value));
+    if (ret >= 0) {
+        ape_dec->num_channels = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_APE_SAMPLE_RATE,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        ape_dec->sample_rate = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_APE_SEEK_TABLE_PRESENT,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        ape_dec->seek_table_present = atoi(value);
+        out->is_compr_metadata_avail = true;
+    }
+
+    ALOGV("APE CSD values: fmt 0x%x, id 0x%x, APE type 0x%x"
+            " compatibleVersion %d compressionLevel %d"
+            " formatFlags %d blocksPerFrame %d finalFrameBlocks %d"
+            " totalFrames %d bitsPerSample %d numChannels %d"
+            " sampleRate %d seekTablePresent %d",
+            out->compr_config.codec->format,
+            out->compr_config.codec->id,
+            out->compr_config.codec->options.generic.reserved[0],
+            ape_dec->compatible_version,
+            ape_dec->compression_level,
+            ape_dec->format_flags,
+            ape_dec->blocks_per_frame,
+            ape_dec->final_frame_blocks,
+            ape_dec->total_frames,
+            ape_dec->bits_per_sample,
+            ape_dec->num_channels,
+            ape_dec->sample_rate,
+            ape_dec->seek_table_present);
+
+    return ret;
+}
+
+static int get_vorbis_dec_info(struct stream_out *out,
+                                struct str_parms *parms) {
+    int ret = 0;
+    char value[32];
+    struct snd_generic_dec_vorbis *vorbis_dec = NULL;
+
+    /* reserved[0] will contain the Vorbis decoder type */
+    out->compr_config.codec->options.generic.reserved[0] =
+                                                AUDIO_COMP_FORMAT_VORBIS;
+    /* reserved[1] onwards will contain the Vorbis decoder format info */
+    vorbis_dec = (struct snd_generic_dec_vorbis *)
+                    &(out->compr_config.codec->options.generic.reserved[1]);
+    ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_VORBIS_BITSTREAM_FMT,
+                                value, sizeof(value));
+    if (ret >= 0) {
+        // transcoded bitstream mode
+        vorbis_dec->bit_stream_fmt = (atoi(value) > 0) ? 1 : 0;
+        out->is_compr_metadata_avail = true;
+    }
+
+    ALOGV("Vorbis values: fmt 0x%x, id 0x%x, Vorbis type 0x%x"
+            " bitStreamFmt %d\n",
+          out->compr_config.codec->format,
+          out->compr_config.codec->id,
+          out->compr_config.codec->options.generic.reserved[0],
+          vorbis_dec->bit_stream_fmt);
+
+     return ret;
+}
+
+int audio_extn_parse_compress_metadata(struct stream_out *out,
+                                       struct str_parms *parms)
+{
+    int ret = 0;
+    char value[32];
+
+    if (!if_compress_meta_data_feature_enabled())
+        return ret;
+
+    if (out->format == AUDIO_FORMAT_FLAC) {
+        ret = get_flac_dec_info(out, parms);
+    } else if (out->format == AUDIO_FORMAT_ALAC) {
+        ret = get_alac_dec_info(out, parms);
+    } else if (out->format == AUDIO_FORMAT_APE) {
+        ret = get_ape_dec_info(out, parms);
+    } else if (out->format == AUDIO_FORMAT_VORBIS) {
+        ret = get_vorbis_dec_info(out, parms);
+    } else if (out->format == AUDIO_FORMAT_WMA ||
+                out->format == AUDIO_FORMAT_WMA_PRO) {
+        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_FORMAT_TAG,
+                                value, sizeof(value));
+        if (ret >= 0) {
+            out->compr_config.codec->format = atoi(value);
+            out->is_compr_metadata_avail = true;
+        }
+
+        ret = get_wma_dec_info(out, parms);
+    }
+
+    return ret;
+}
+
+#else
 int audio_extn_parse_compress_metadata(struct stream_out *out,
                                        struct str_parms *parms)
 {
@@ -3193,55 +3687,12 @@ int audio_extn_parse_compress_metadata(struct stream_out *out,
             out->compr_config.codec->format = atoi(value);
             out->is_compr_metadata_avail = true;
         }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_AVG_BIT_RATE, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.avg_bit_rate = atoi(value);
-            out->is_compr_metadata_avail = true;
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_BLOCK_ALIGN, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.super_block_align = atoi(value);
-            out->is_compr_metadata_avail = true;
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_BIT_PER_SAMPLE, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.bits_per_sample = atoi(value);
-            out->is_compr_metadata_avail = true;
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_CHANNEL_MASK, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.channelmask = atoi(value);
-            out->is_compr_metadata_avail = true;
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.encodeopt = atoi(value);
-            out->is_compr_metadata_avail = true;
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION1, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.encodeopt1 = atoi(value);
-            out->is_compr_metadata_avail = true;
-        }
-        ret = str_parms_get_str(parms, AUDIO_OFFLOAD_CODEC_WMA_ENCODE_OPTION2, value, sizeof(value));
-        if (ret >= 0) {
-            out->compr_config.codec->options.wma.encodeopt2 = atoi(value);
-            out->is_compr_metadata_avail = true;
-        }
-        ALOGV("WMA params: fmt %x, bit rate %x, balgn %x, sr %d, chmsk %x"
-                " encop %x, op1 %x, op2 %x",
-                out->compr_config.codec->format,
-                out->compr_config.codec->options.wma.avg_bit_rate,
-                out->compr_config.codec->options.wma.super_block_align,
-                out->compr_config.codec->options.wma.bits_per_sample,
-                out->compr_config.codec->options.wma.channelmask,
-                out->compr_config.codec->options.wma.encodeopt,
-                out->compr_config.codec->options.wma.encodeopt1,
-                out->compr_config.codec->options.wma.encodeopt2);
+        ret = get_wma_info(out, parms);
     }
 
     return ret;
 }
+#endif
 
 #ifdef AUXPCM_BT_ENABLED
 int32_t audio_extn_read_xml(struct audio_device *adev, uint32_t mixer_card,
@@ -3284,7 +3735,7 @@ static int audio_extn_set_multichannel_mask(struct audio_device *adev,
     /* validate input params. Avoid updated channel mask if loopback device */
     if ((channel_count == 6) &&
         (in->format == AUDIO_FORMAT_PCM_16_BIT) &&
-        (!is_loopback_input_device(in->device))) {
+        (!is_loopback_input_device(get_device_types(&in->device_list)))) {
         switch (max_mic_count) {
             case 4:
                 config->channel_mask = AUDIO_CHANNEL_INDEX_MASK_4;
@@ -3559,13 +4010,14 @@ int audio_extn_set_device_cfg_params(struct audio_device *adev,
 
     adev_device_cfg_ptr = adev->device_cfg_params;
     /* Create an out stream to get snd device from audio device */
-    out.devices = device_cfg_params->device;
+    reassign_device_list(&out.device_list, device_cfg_params->device, "");
     out.sample_rate = device_cfg_params->sample_rate;
-    snd_device = platform_get_output_snd_device(adev->platform, &out);
+    snd_device = platform_get_output_snd_device(adev->platform, &out, USECASE_TYPE_MAX);
     backend_idx = platform_get_backend_index(snd_device);
 
     ALOGV("%s:: device %d sample_rate %d snd_device %d backend_idx %d",
-                __func__, out.devices, out.sample_rate, snd_device, backend_idx);
+                __func__, get_device_types(&out.device_list),
+                out.sample_rate, snd_device, backend_idx);
 
     ALOGV("%s:: Device Config Params from Client samplerate %d  channels %d"
           " bit_width %d  format %d  device %d  channel_map[0] %d channel_map[1] %d"
@@ -3597,7 +4049,7 @@ void fm_feature_init(bool is_feature_enabled)
 void audio_extn_fm_get_parameters(struct str_parms *query, struct str_parms *reply)
 {
     if(audio_extn_fm_power_opt_enabled) {
-       ALOGD("%s: Enter", __func__);
+       ALOGV("%s: Enter", __func__);
        fm_get_parameters(query, reply);
     }
 }
@@ -3606,7 +4058,7 @@ void audio_extn_fm_set_parameters(struct audio_device *adev,
                                   struct str_parms *parms)
 {
     if(audio_extn_fm_power_opt_enabled) {
-       ALOGD("%s: Enter", __func__);
+       ALOGV("%s: Enter", __func__);
        fm_set_parameters(adev, parms);
     }
 }
@@ -4200,6 +4652,9 @@ static a2dp_start_capture_t a2dp_start_capture;
 typedef int (*a2dp_stop_capture_t)();
 static a2dp_stop_capture_t a2dp_stop_capture;
 
+typedef bool (*a2dp_set_source_backend_cfg_t)();
+static a2dp_set_source_backend_cfg_t a2dp_set_source_backend_cfg;
+
 typedef int (*sco_start_configuration_t)();
 static sco_start_configuration_t sco_start_configuration;
 
@@ -4254,7 +4709,10 @@ int a2dp_offload_feature_init(bool is_feature_enabled)
             !(a2dp_start_capture =
                  (a2dp_start_capture_t)dlsym(a2dp_lib_handle, "a2dp_start_capture")) ||
             !(a2dp_stop_capture =
-                 (a2dp_stop_capture_t)dlsym(a2dp_lib_handle, "a2dp_stop_capture"))) {
+                 (a2dp_stop_capture_t)dlsym(a2dp_lib_handle, "a2dp_stop_capture")) ||
+            !(a2dp_set_source_backend_cfg =
+                 (a2dp_set_source_backend_cfg_t)dlsym(
+                                     a2dp_lib_handle, "a2dp_set_source_backend_cfg"))) {
             ALOGE("%s: dlsym failed", __func__);
             goto feature_disabled;
         }
@@ -4292,6 +4750,7 @@ feature_disabled:
     a2dp_source_is_suspended = NULL;
     a2dp_start_capture = NULL;
     a2dp_stop_capture = NULL;
+    a2dp_set_source_backend_cfg = NULL;
 
     ALOGW(":: %s: ---- Feature A2DP_OFFLOAD is disabled ----", __func__);
     return -ENOSYS;
@@ -4302,7 +4761,8 @@ void audio_extn_a2dp_init(void *adev)
     if (a2dp_init) {
         a2dp_offload_init_config_t a2dp_init_config;
         a2dp_init_config.fp_platform_get_pcm_device_id = platform_get_pcm_device_id;
-        a2dp_init_config.fp_check_a2dp_restore = check_a2dp_restore;
+        a2dp_init_config.fp_check_a2dp_restore_l = check_a2dp_restore_l;
+        a2dp_init_config.fp_platform_switch_voice_call_device_post = platform_switch_voice_call_device_post;
 
         a2dp_init(adev, a2dp_init_config);
     }
@@ -4362,6 +4822,12 @@ uint32_t audio_extn_a2dp_get_encoder_latency()
                 a2dp_get_encoder_latency() : 0);
 }
 
+uint32_t audio_extn_a2dp_get_decoder_latency()
+{
+    return (a2dp_get_encoder_latency ?
+                a2dp_get_encoder_latency() : 0);
+}
+
 bool audio_extn_a2dp_sink_is_ready()
 {
     return (a2dp_sink_is_ready ?
@@ -4390,6 +4856,12 @@ int audio_extn_a2dp_stop_capture()
     return (a2dp_stop_capture ? a2dp_stop_capture() : 0);
 }
 
+bool audio_extn_a2dp_set_source_backend_cfg()
+{
+    return (a2dp_set_source_backend_cfg ?
+                a2dp_set_source_backend_cfg() : false);
+}
+
 int audio_extn_sco_start_configuration()
 {
     return (sco_start_configuration? sco_start_configuration() : 0);
@@ -4404,9 +4876,17 @@ void audio_extn_sco_reset_configuration()
 
 // START: HFP ======================================================================
 #ifdef __LP64__
+#ifdef LINUX_ENABLED
+#define HFP_LIB_PATH "/usr/lib64/libhfp.so"
+#else
 #define HFP_LIB_PATH "/vendor/lib64/libhfp.so"
+#endif
+#else
+#ifdef LINUX_ENABLED
+#define HFP_LIB_PATH "/usr/lib/libhfp.so"
 #else
 #define HFP_LIB_PATH "/vendor/lib/libhfp.so"
+#endif
 #endif
 
 static void *hfp_lib_handle = NULL;
@@ -4476,6 +4956,10 @@ int hfp_feature_init(bool is_feature_enabled)
         init_config.fp_disable_audio_route = disable_audio_route;
         init_config.fp_disable_snd_device = disable_snd_device;
         init_config.fp_voice_get_mic_mute = voice_get_mic_mute;
+        init_config.fp_audio_extn_auto_hal_start_hfp_downlink =
+                                        audio_extn_auto_hal_start_hfp_downlink;
+        init_config.fp_audio_extn_auto_hal_stop_hfp_downlink =
+                                        audio_extn_auto_hal_stop_hfp_downlink;
 
         hfp_init(init_config);
         ALOGD("%s:: ---- Feature HFP is Enabled ----", __func__);
@@ -4494,7 +4978,6 @@ feature_disabled:
     hfp_set_mic_mute = NULL;
     hfp_set_mic_mute2 = NULL;
     hfp_set_parameters = NULL;
-
     ALOGW(":: %s: ---- Feature HFP is disabled ----", __func__);
     return -ENOSYS;
 }
@@ -4530,6 +5013,107 @@ int audio_extn_hfp_set_mic_mute2(struct audio_device *adev, bool state)
                     hfp_set_mic_mute2(adev, state): -1);
 }
 // END: HFP ========================================================================
+
+// START: ICC ======================================================================
+#ifdef __LP64__
+#define ICC_LIB_PATH "/vendor/lib64/libicc.so"
+#else
+#define ICC_LIB_PATH "/vendor/lib/libicc.so"
+#endif
+
+static void *icc_lib_handle = NULL;
+
+typedef void (*icc_init_t)(icc_init_config_t);
+static icc_init_t icc_init;
+
+typedef bool (*icc_is_active_t)(struct audio_device *adev);
+static icc_is_active_t icc_is_active;
+
+typedef audio_usecase_t (*icc_get_usecase_t)();
+static icc_get_usecase_t icc_get_usecase;
+
+typedef void (*icc_set_parameters_t)(struct audio_device *adev,
+                                           struct str_parms *parms);
+static icc_set_parameters_t icc_set_parameters;
+
+int icc_feature_init(bool is_feature_enabled)
+{
+    ALOGD("%s: Called with feature %s", __func__,
+                  is_feature_enabled ? "Enabled" : "NOT Enabled");
+    if (is_feature_enabled) {
+        // dlopen lib
+        icc_lib_handle = dlopen(ICC_LIB_PATH, RTLD_NOW);
+
+        if (!icc_lib_handle) {
+            ALOGE("%s: dlopen failed", __func__);
+            goto feature_disabled;
+        }
+        if (!(icc_init = (icc_init_t)dlsym(
+                            icc_lib_handle, "icc_init")) ||
+            !(icc_is_active =
+                 (icc_is_active_t)dlsym(
+                            icc_lib_handle, "icc_is_active")) ||
+            !(icc_get_usecase =
+                 (icc_get_usecase_t)dlsym(
+                            icc_lib_handle, "icc_get_usecase")) ||
+            !(icc_set_parameters =
+                 (icc_set_parameters_t)dlsym(
+                            icc_lib_handle, "icc_set_parameters"))) {
+            ALOGE("%s: dlsym failed", __func__);
+            goto feature_disabled;
+        }
+        icc_init_config_t init_config;
+        init_config.fp_platform_get_pcm_device_id = platform_get_pcm_device_id;
+        init_config.fp_platform_set_echo_reference = platform_set_echo_reference;
+        init_config.fp_select_devices = select_devices;
+        init_config.fp_audio_extn_ext_hw_plugin_usecase_start =
+                                        audio_extn_ext_hw_plugin_usecase_start;
+        init_config.fp_audio_extn_ext_hw_plugin_usecase_stop =
+                                        audio_extn_ext_hw_plugin_usecase_stop;
+        init_config.fp_get_usecase_from_list = get_usecase_from_list;
+        init_config.fp_disable_audio_route = disable_audio_route;
+        init_config.fp_disable_snd_device = disable_snd_device;
+
+        icc_init(init_config);
+        ALOGD("%s:: ---- Feature ICC is Enabled ----", __func__);
+        return 0;
+    }
+
+feature_disabled:
+    if (icc_lib_handle) {
+        dlclose(icc_lib_handle);
+        icc_lib_handle = NULL;
+    }
+
+    icc_init = NULL;
+    icc_is_active = NULL;
+    icc_get_usecase = NULL;
+    icc_set_parameters = NULL;
+
+    ALOGW(":: %s: ---- Feature ICC is disabled ----", __func__);
+    return -ENOSYS;
+}
+
+bool audio_extn_icc_is_active(struct audio_device *adev)
+{
+    return ((icc_is_active) ?
+                    icc_is_active(adev): false);
+}
+
+audio_usecase_t audio_extn_icc_get_usecase()
+{
+    return ((icc_get_usecase) ?
+                    icc_get_usecase(): -1);
+}
+
+void audio_extn_icc_set_parameters(struct audio_device *adev,
+                                           struct str_parms *parms)
+{
+    ((icc_set_parameters) ?
+                    icc_set_parameters(adev, parms): NULL);
+}
+
+// END: ICC ========================================================================
 
 // START: EXT_HW_PLUGIN ===================================================================
 #ifdef __LP64__
@@ -4639,8 +5223,8 @@ void* audio_extn_ext_hw_plugin_init(struct audio_device *adev)
 {
     if(ext_hw_plugin_init) {
         ext_hw_plugin_init_config_t ext_hw_plugin_init_config;
-        ext_hw_plugin_init_config.fp_audio_route_apply_and_update_path =
-                                              audio_route_apply_and_update_path;
+        ext_hw_plugin_init_config.fp_b64decode = b64decode;
+        ext_hw_plugin_init_config.fp_b64encode = b64encode;
         return ext_hw_plugin_init(adev, ext_hw_plugin_init_config);
     }
     else
@@ -5053,13 +5637,17 @@ bool audio_extn_cin_applicable_stream(struct stream_in *in)
 {
     return (audio_extn_compress_in_enabled? cin_applicable_stream(in): false);
 }
-bool audio_extn_cin_attached_usecase(audio_usecase_t uc_id)
+bool audio_extn_cin_attached_usecase(struct stream_in *in)
 {
-    return (audio_extn_compress_in_enabled? cin_attached_usecase(uc_id): false);
+    return (audio_extn_compress_in_enabled? cin_attached_usecase(in): false);
 }
 bool audio_extn_cin_format_supported(audio_format_t format)
 {
     return (audio_extn_compress_in_enabled? cin_format_supported(format): false);
+}
+int audio_extn_cin_acquire_usecase(struct stream_in *in)
+{
+    return (audio_extn_compress_in_enabled? cin_acquire_usecase(in): 0);
 }
 size_t audio_extn_cin_get_buffer_size(struct stream_in *in)
 {
@@ -5177,7 +5765,7 @@ void audio_extn_enable_hifi_filter(struct audio_device *adev, bool value)
         return;
     } else {
         mixer_ctl_set_value(ctl, 0, value);
-        ALOGD("%s: mixer_value set %d", __func__, value);
+        ALOGV("%s: mixer_value set %d", __func__, value);
     }
     return;
 }
@@ -5372,6 +5960,11 @@ typedef void (*maxxaudio_set_parameters_t)(struct audio_device *,
                                   struct str_parms *);
 static maxxaudio_set_parameters_t maxxaudio_set_parameters;
 
+typedef void (*maxxaudio_get_parameters_t)(struct audio_device *,
+                                  struct str_parms *,
+                                  struct str_parms *);
+static maxxaudio_get_parameters_t maxxaudio_get_parameters;
+
 typedef bool (*maxxaudio_supported_usb_t)();
 static maxxaudio_supported_usb_t maxxaudio_supported_usb;
 
@@ -5399,6 +5992,8 @@ int maxx_audio_feature_init(bool is_feature_enabled)
                  (maxxaudio_set_device_t)dlsym(maxxaudio_lib_handle, "ma_set_device")) ||
             !(maxxaudio_set_parameters =
                  (maxxaudio_set_parameters_t)dlsym(maxxaudio_lib_handle, "ma_set_parameters")) ||
+            !(maxxaudio_get_parameters =
+                 (maxxaudio_get_parameters_t)dlsym(maxxaudio_lib_handle, "ma_get_parameters")) ||
             !(maxxaudio_supported_usb =
                  (maxxaudio_supported_usb_t)dlsym(
                                     maxxaudio_lib_handle, "ma_supported_usb"))) {
@@ -5420,6 +6015,7 @@ feature_disabled:
     maxxaudio_set_state = NULL;
     maxxaudio_set_device = NULL;
     maxxaudio_set_parameters = NULL;
+    maxxaudio_get_parameters = NULL;
     maxxaudio_supported_usb = NULL;
     ALOGW(":: %s: ---- Feature MAXX_AUDIO is disabled ----", __func__);
     return -ENOSYS;
@@ -5467,22 +6063,517 @@ void audio_extn_ma_set_parameters(struct audio_device *adev,
         maxxaudio_set_parameters(adev, parms);
 }
 
+void audio_extn_ma_get_parameters(struct audio_device *adev,
+                                  struct str_parms *query,
+                                  struct str_parms *reply)
+{
+    if (maxxaudio_get_parameters)
+        maxxaudio_get_parameters(adev, query, reply);
+}
+
 bool audio_extn_ma_supported_usb()
 {
     return (maxxaudio_supported_usb ? maxxaudio_supported_usb(): false);
 }
 // END: MAXX_AUDIO =====================================================================
 
+// START: AUTO_HAL ===================================================================
+#ifdef LINUX_ENABLED
+#ifdef __LP64__
+#define AUTO_HAL_LIB_PATH "/usr/lib64/libautohal.so"
+#else
+#define AUTO_HAL_LIB_PATH "/usr/lib/libautohal.so"
+#endif
+#else
+#ifdef __LP64__
+#define AUTO_HAL_LIB_PATH "/vendor/lib64/libautohal.so"
+#else
+#define AUTO_HAL_LIB_PATH "/vendor/lib/libautohal.so"
+#endif
+#endif
+
+static void *auto_hal_lib_handle = NULL;
+
+typedef int (*auto_hal_init_t)(struct audio_device*,
+                                auto_hal_init_config_t);
+static auto_hal_init_t auto_hal_init;
+
+typedef void (*auto_hal_deinit_t)();
+static auto_hal_deinit_t auto_hal_deinit;
+
+typedef int (*auto_hal_create_audio_patch_t)(struct audio_hw_device*,
+                                unsigned int,
+                                const struct audio_port_config*,
+                                unsigned int,
+                                const struct audio_port_config*,
+                                audio_patch_handle_t*);
+static auto_hal_create_audio_patch_t auto_hal_create_audio_patch;
+
+typedef int (*auto_hal_release_audio_patch_t)(struct audio_hw_device*,
+                                audio_patch_handle_t);
+static auto_hal_release_audio_patch_t auto_hal_release_audio_patch;
+
+typedef int (*auto_hal_get_car_audio_stream_from_address_t)(const char*);
+static auto_hal_get_car_audio_stream_from_address_t auto_hal_get_car_audio_stream_from_address;
+
+typedef int (*auto_hal_open_output_stream_t)(struct stream_out*);
+static auto_hal_open_output_stream_t auto_hal_open_output_stream;
+
+typedef int (*auto_hal_open_input_stream_t)(struct stream_in*);
+static auto_hal_open_input_stream_t auto_hal_open_input_stream;
+
+typedef int (*auto_hal_open_echo_reference_stream_t)(struct stream_in*);
+static auto_hal_open_echo_reference_stream_t auto_hal_open_echo_reference_stream;
+
+typedef bool (*auto_hal_is_bus_device_usecase_t)(audio_usecase_t);
+static auto_hal_is_bus_device_usecase_t auto_hal_is_bus_device_usecase;
+
+typedef int (*auto_hal_get_audio_port_t)(struct audio_hw_device*,
+                                struct audio_port*);
+static auto_hal_get_audio_port_t auto_hal_get_audio_port;
+
+typedef int (*auto_hal_set_audio_port_config_t)(struct audio_hw_device*,
+                                const struct audio_port_config*);
+static auto_hal_set_audio_port_config_t auto_hal_set_audio_port_config;
+
+typedef void (*auto_hal_set_parameters_t)(struct audio_device*,
+                                struct str_parms*);
+static auto_hal_set_parameters_t auto_hal_set_parameters;
+
+typedef int (*auto_hal_start_hfp_downlink_t)(struct audio_device*,
+                                struct audio_usecase*);
+static auto_hal_start_hfp_downlink_t auto_hal_start_hfp_downlink;
+
+typedef int (*auto_hal_stop_hfp_downlink_t)(struct audio_device*,
+                                struct audio_usecase*);
+static auto_hal_stop_hfp_downlink_t auto_hal_stop_hfp_downlink;
+
+typedef snd_device_t (*auto_hal_get_input_snd_device_t)(struct audio_device*,
+                                audio_usecase_t);
+static auto_hal_get_input_snd_device_t auto_hal_get_input_snd_device;
+
+typedef snd_device_t (*auto_hal_get_output_snd_device_t)(struct audio_device*,
+                                audio_usecase_t);
+static auto_hal_get_output_snd_device_t auto_hal_get_output_snd_device;
+
+typedef snd_device_t (*auto_hal_get_snd_device_for_car_audio_stream_t)(int
+                                car_audio_stream);
+static auto_hal_get_snd_device_for_car_audio_stream_t auto_hal_get_snd_device_for_car_audio_stream;
+
+typedef bool (*auto_hal_overwrite_priority_for_auto_t)(struct stream_in*);
+static auto_hal_overwrite_priority_for_auto_t auto_hal_overwrite_priority_for_auto;
+
+int auto_hal_feature_init(bool is_feature_enabled)
+{
+    ALOGD("%s: Called with feature %s", __func__,
+                  is_feature_enabled ? "Enabled" : "NOT Enabled");
+
+#ifdef LINUX_ENABLED
+    is_feature_enabled = true;
+#endif
+
+    if (is_feature_enabled) {
+        // dlopen lib
+        auto_hal_lib_handle = dlopen(AUTO_HAL_LIB_PATH, RTLD_NOW);
+
+        if (!auto_hal_lib_handle) {
+            ALOGE("%s: dlopen failed", __func__);
+            goto feature_disabled;
+        }
+        if (!(auto_hal_init = (auto_hal_init_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_init")) ||
+            !(auto_hal_deinit =
+                 (auto_hal_deinit_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_deinit")) ||
+            !(auto_hal_create_audio_patch =
+                 (auto_hal_create_audio_patch_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_create_audio_patch")) ||
+            !(auto_hal_release_audio_patch =
+                 (auto_hal_release_audio_patch_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_release_audio_patch")) ||
+            !(auto_hal_get_car_audio_stream_from_address =
+                 (auto_hal_get_car_audio_stream_from_address_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_get_car_audio_stream_from_address")) ||
+            !(auto_hal_open_output_stream =
+                 (auto_hal_open_output_stream_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_open_output_stream")) ||
+            !(auto_hal_open_input_stream =
+                 (auto_hal_open_input_stream_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_open_input_stream")) ||
+            !(auto_hal_open_echo_reference_stream =
+                 (auto_hal_open_echo_reference_stream_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_open_echo_reference_stream")) ||
+            !(auto_hal_is_bus_device_usecase =
+                 (auto_hal_is_bus_device_usecase_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_is_bus_device_usecase")) ||
+            !(auto_hal_get_audio_port =
+                 (auto_hal_get_audio_port_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_get_audio_port")) ||
+            !(auto_hal_set_audio_port_config =
+                 (auto_hal_set_audio_port_config_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_set_audio_port_config")) ||
+            !(auto_hal_set_parameters =
+                 (auto_hal_set_parameters_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_set_parameters")) ||
+            !(auto_hal_start_hfp_downlink =
+                 (auto_hal_start_hfp_downlink_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_start_hfp_downlink")) ||
+            !(auto_hal_stop_hfp_downlink =
+                 (auto_hal_stop_hfp_downlink_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_stop_hfp_downlink")) ||
+            !(auto_hal_get_input_snd_device =
+                 (auto_hal_get_input_snd_device_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_get_input_snd_device")) ||
+            !(auto_hal_get_output_snd_device =
+                 (auto_hal_get_output_snd_device_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_get_output_snd_device")) ||
+            !(auto_hal_get_snd_device_for_car_audio_stream =
+                 (auto_hal_get_snd_device_for_car_audio_stream_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_get_snd_device_for_car_audio_stream")) ||
+            !(auto_hal_overwrite_priority_for_auto =
+                 (auto_hal_overwrite_priority_for_auto_t)dlsym(
+                            auto_hal_lib_handle, "auto_hal_overwrite_priority_for_auto"))) {
+            ALOGE("%s: dlsym failed", __func__);
+            goto feature_disabled;
+        }
+        ALOGD("%s:: ---- Feature AUTO_HAL is Enabled ----", __func__);
+        return 0;
+    }
+
+feature_disabled:
+    if (auto_hal_lib_handle) {
+        dlclose(auto_hal_lib_handle);
+        auto_hal_lib_handle = NULL;
+    }
+
+    auto_hal_init = NULL;
+    auto_hal_deinit = NULL;
+    auto_hal_create_audio_patch = NULL;
+    auto_hal_release_audio_patch = NULL;
+    auto_hal_get_car_audio_stream_from_address = NULL;
+    auto_hal_open_output_stream = NULL;
+    auto_hal_open_input_stream = NULL;
+    auto_hal_open_echo_reference_stream = NULL;
+    auto_hal_is_bus_device_usecase = NULL;
+    auto_hal_get_audio_port = NULL;
+    auto_hal_set_audio_port_config = NULL;
+    auto_hal_set_parameters = NULL;
+    auto_hal_start_hfp_downlink = NULL;
+    auto_hal_stop_hfp_downlink = NULL;
+    auto_hal_get_input_snd_device = NULL;
+    auto_hal_get_output_snd_device = NULL;
+    auto_hal_get_snd_device_for_car_audio_stream = NULL;
+    auto_hal_overwrite_priority_for_auto = NULL;
+
+    ALOGW(":: %s: ---- Feature AUTO_HAL is disabled ----", __func__);
+    return -ENOSYS;
+}
+
+int audio_extn_auto_hal_init(struct audio_device *adev)
+{
+    if(auto_hal_init) {
+        auto_hal_init_config_t auto_hal_init_config;
+        auto_hal_init_config.fp_audio_extn_ext_hw_plugin_usecase_start = audio_extn_ext_hw_plugin_usecase_start;
+        auto_hal_init_config.fp_audio_extn_ext_hw_plugin_usecase_stop = audio_extn_ext_hw_plugin_usecase_stop;
+        auto_hal_init_config.fp_get_usecase_from_list = get_usecase_from_list;
+        auto_hal_init_config.fp_get_output_period_size = get_output_period_size;
+        auto_hal_init_config.fp_audio_extn_ext_hw_plugin_set_audio_gain = audio_extn_ext_hw_plugin_set_audio_gain;
+        auto_hal_init_config.fp_select_devices = select_devices;
+        auto_hal_init_config.fp_disable_audio_route = disable_audio_route;
+        auto_hal_init_config.fp_disable_snd_device = disable_snd_device;
+        auto_hal_init_config.fp_adev_get_active_input = adev_get_active_input;
+        auto_hal_init_config.fp_platform_set_echo_reference = platform_set_echo_reference;
+        auto_hal_init_config.fp_platform_get_eccarstate = platform_get_eccarstate;
+        auto_hal_init_config.fp_generate_patch_handle = generate_patch_handle;
+        return auto_hal_init(adev, auto_hal_init_config);
+    }
+    else
+        return 0;
+}
+
+void audio_extn_auto_hal_deinit()
+{
+    if (auto_hal_deinit)
+        auto_hal_deinit();
+}
+
+int audio_extn_auto_hal_create_audio_patch(struct audio_hw_device *dev,
+                                unsigned int num_sources,
+                                const struct audio_port_config *sources,
+                                unsigned int num_sinks,
+                                const struct audio_port_config *sinks,
+                                audio_patch_handle_t *handle)
+{
+    return ((auto_hal_create_audio_patch) ?
+                            auto_hal_create_audio_patch(dev,
+                                num_sources,
+                                sources,
+                                num_sinks,
+                                sinks,
+                                handle): 0);
+}
+
+int audio_extn_auto_hal_release_audio_patch(struct audio_hw_device *dev,
+                                audio_patch_handle_t handle)
+{
+    return ((auto_hal_release_audio_patch) ?
+                            auto_hal_release_audio_patch(dev, handle): 0);
+}
+
+int audio_extn_auto_hal_get_car_audio_stream_from_address(const char *address)
+{
+    return ((auto_hal_get_car_audio_stream_from_address) ?
+                            auto_hal_get_car_audio_stream_from_address(address): -ENOSYS);
+}
+
+int audio_extn_auto_hal_open_output_stream(struct stream_out *out)
+{
+    return ((auto_hal_open_output_stream) ?
+                            auto_hal_open_output_stream(out): -ENOSYS);
+}
+
+int audio_extn_auto_hal_open_input_stream(struct stream_in *in)
+{
+    return ((auto_hal_open_input_stream) ?
+                            auto_hal_open_input_stream(in): -ENOSYS);
+}
+
+int audio_extn_auto_hal_open_echo_reference_stream(struct stream_in *in)
+{
+    return ((auto_hal_open_echo_reference_stream) ?
+                            auto_hal_open_echo_reference_stream(in): 0);
+}
+
+bool audio_extn_auto_hal_is_bus_device_usecase(audio_usecase_t uc_id)
+{
+    return ((auto_hal_is_bus_device_usecase) ?
+                            auto_hal_is_bus_device_usecase(uc_id): false);
+}
+
+int audio_extn_auto_hal_get_audio_port(struct audio_hw_device *dev,
+                                struct audio_port *config)
+{
+    return ((auto_hal_get_audio_port) ?
+                            auto_hal_get_audio_port(dev, config): 0);
+}
+
+int audio_extn_auto_hal_set_audio_port_config(struct audio_hw_device *dev,
+                                const struct audio_port_config *config)
+{
+    return ((auto_hal_set_audio_port_config) ?
+                            auto_hal_set_audio_port_config(dev, config): 0);
+}
+
+void audio_extn_auto_hal_set_parameters(struct audio_device *adev,
+                                        struct str_parms *parms)
+{
+    if (auto_hal_set_parameters)
+        auto_hal_set_parameters(adev, parms);
+}
+
+int audio_extn_auto_hal_start_hfp_downlink(struct audio_device *adev,
+                                struct audio_usecase *uc_info)
+{
+    return ((auto_hal_start_hfp_downlink) ?
+                            auto_hal_start_hfp_downlink(adev, uc_info): 0);
+}
+
+int audio_extn_auto_hal_stop_hfp_downlink(struct audio_device *adev,
+                                struct audio_usecase *uc_info)
+{
+    return ((auto_hal_stop_hfp_downlink) ?
+                            auto_hal_stop_hfp_downlink(adev, uc_info): 0);
+}
+
+snd_device_t audio_extn_auto_hal_get_input_snd_device(struct audio_device *adev,
+                                audio_usecase_t uc_id)
+{
+    return ((auto_hal_get_input_snd_device) ?
+                            auto_hal_get_input_snd_device(adev, uc_id): SND_DEVICE_NONE);
+}
+
+snd_device_t audio_extn_auto_hal_get_output_snd_device(struct audio_device *adev,
+                                audio_usecase_t uc_id)
+{
+    return ((auto_hal_get_output_snd_device) ?
+                            auto_hal_get_output_snd_device(adev, uc_id): SND_DEVICE_NONE);
+}
+
+snd_device_t audio_extn_auto_hal_get_snd_device_for_car_audio_stream(int car_audio_stream)
+{
+    return ((auto_hal_get_snd_device_for_car_audio_stream) ?
+                            auto_hal_get_snd_device_for_car_audio_stream(car_audio_stream): SND_DEVICE_NONE);
+}
+
+bool audio_extn_auto_hal_overwrite_priority_for_auto(struct stream_in *in)
+{
+    return ((auto_hal_overwrite_priority_for_auto) ?
+                            auto_hal_overwrite_priority_for_auto(in): false);
+}
+
+// END: AUTO_HAL ===================================================================
+
+// START: Synth ======================================================================
+#ifdef __LP64__
+#define SYNTH_LIB_PATH "/vendor/lib64/libsynth.so"
+#else
+#define SYNTH_LIB_PATH "/vendor/lib/libsynth.so"
+#endif
+
+static void *synth_lib_handle = NULL;
+
+typedef void (*synth_init_t)(synth_init_config_t);
+static synth_init_t synth_init;
+
+typedef bool (*synth_is_active_t)(struct audio_device *adev);
+static synth_is_active_t synth_is_active;
+
+typedef void (*synth_set_parameters_t)(struct audio_device *adev,
+                                           struct str_parms *parms);
+static synth_set_parameters_t synth_set_parameters;
+
+int synth_feature_init(bool is_feature_enabled)
+{
+    ALOGD("%s: Called with feature %s", __func__,
+                  is_feature_enabled ? "Enabled" : "NOT Enabled");
+    if (is_feature_enabled) {
+        // dlopen lib
+        synth_lib_handle = dlopen(SYNTH_LIB_PATH, RTLD_NOW);
+
+        if (!synth_lib_handle) {
+            ALOGE("%s: dlopen failed", __func__);
+            goto feature_disabled;
+        }
+        if (!(synth_init = (synth_init_t)dlsym(
+                            synth_lib_handle, "synth_init")) ||
+            !(synth_is_active =
+                 (synth_is_active_t)dlsym(
+                            synth_lib_handle, "synth_is_active")) ||
+            !(synth_set_parameters =
+                 (synth_set_parameters_t)dlsym(
+                            synth_lib_handle, "synth_set_parameters"))) {
+            ALOGE("%s: dlsym failed", __func__);
+            goto feature_disabled;
+        }
+        synth_init_config_t init_config;
+        init_config.fp_platform_get_pcm_device_id = platform_get_pcm_device_id;
+        init_config.fp_get_usecase_from_list = get_usecase_from_list;
+        init_config.fp_select_devices = select_devices;
+        init_config.fp_disable_audio_route = disable_audio_route;
+        init_config.fp_disable_snd_device = disable_snd_device;
+
+        synth_init(init_config);
+        ALOGD("%s:: ---- Feature Synth is Enabled ----", __func__);
+        return 0;
+    }
+
+feature_disabled:
+    if (synth_lib_handle) {
+        dlclose(synth_lib_handle);
+        synth_lib_handle = NULL;
+    }
+
+    synth_init = NULL;
+    synth_is_active = NULL;
+    synth_set_parameters = NULL;
+
+    ALOGW(":: %s: ---- Feature Synth is disabled ----", __func__);
+    return -ENOSYS;
+}
+
+bool audio_extn_synth_is_active(struct audio_device *adev)
+{
+    return ((synth_is_active) ?
+                    synth_is_active(adev): false);
+}
+
+void audio_extn_synth_set_parameters(struct audio_device *adev,
+                                           struct str_parms *parms)
+{
+    ((synth_set_parameters) ?
+                    synth_set_parameters(adev, parms): NULL);
+}
+
+// END: Synth ========================================================================
+
+// START: Power Policy Client ======================================================================
+#ifdef __LP64__
+#define POWER_POLICY_LIB_PATH "/vendor/lib64/libaudiopowerpolicy.so"
+#else
+#define POWER_POLICY_LIB_PATH "/vendor/lib/libaudiopowerpolicy.so"
+#endif
+
+static void* power_policy_lib_handle;
+typedef int (*launch_power_policy_t) ();
+static launch_power_policy_t launch_power_policy;
+
+static void* power_policy_thread_func(void* arg __unused) {
+    if (launch_power_policy == NULL) {
+        ALOGE("%s: Power Policy launcher is NULL", __func__);
+        goto exit;
+    }
+    ALOGD("%s: Launching Power Policy Client", __func__);
+    launch_power_policy();
+
+exit:
+    pthread_exit(NULL);
+}
+
+static int power_policy_feature_init(bool is_feature_enabled)
+{
+    pthread_t tid;
+    pthread_attr_t attr;
+
+    ALOGD("%s: Called with feature %s", __func__,
+                  is_feature_enabled ? "Enabled" : "NOT Enabled");
+    if (is_feature_enabled) {
+        // dlopen lib
+        power_policy_lib_handle = dlopen(POWER_POLICY_LIB_PATH, RTLD_NOW);
+
+        if (!power_policy_lib_handle) {
+            ALOGE("%s: dlopen failed", __func__);
+            goto feature_disabled;
+        }
+        if (!(launch_power_policy = (launch_power_policy_t)dlsym(
+                                    power_policy_lib_handle, "launchPowerPolicyClient")))
+        {
+            ALOGE("%s: dlsym failed", __func__);
+            goto feature_disabled;
+        }
+
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&tid, &attr, power_policy_thread_func, NULL))
+        {
+            ALOGE("%s: Failed to create power policy thread", __func__);
+            goto feature_disabled;
+        }
+        ALOGD("%s:: ---- Feature Power Policy Client is Enabled ----", __func__);
+        return 0;
+    }
+
+feature_disabled:
+    if (power_policy_lib_handle) {
+        dlclose(power_policy_lib_handle);
+        power_policy_lib_handle = NULL;
+    }
+
+    launch_power_policy = NULL;
+
+    ALOGW(":: %s: ---- Feature Power Policy Client is disabled ----", __func__);
+    return -ENOSYS;
+
+// END: Power Policy Client ======================================================================
+}
 void audio_extn_feature_init()
 {
     vendor_enhanced_info = audio_extn_utils_get_vendor_enhanced_info();
-
     // register feature init functions here
     // each feature needs a vendor property
     // default value added is for GSI (non vendor modified images)
     snd_mon_feature_init(
         property_get_bool("vendor.audio.feature.snd_mon.enable",
-                           true));
+                           false));
     compr_cap_feature_init(
         property_get_bool("vendor.audio.feature.compr_cap.enable",
                            false));
@@ -5512,7 +6603,7 @@ void audio_extn_feature_init()
                            false));
     usb_offload_feature_init(
         property_get_bool("vendor.audio.feature.usb_offload.enable",
-                           true));
+                           false));
     usb_offload_burst_mode_feature_init(
         property_get_bool("vendor.audio.feature.usb_offload_burst_mode.enable",
                            false));
@@ -5545,25 +6636,36 @@ void audio_extn_feature_init()
                            false));
     spkr_prot_feature_init(
         property_get_bool("vendor.audio.feature.spkr_prot.enable",
-                           true));
+                           false));
     fm_feature_init(
         property_get_bool("vendor.audio.feature.fm.enable",
                            false));
     external_qdsp_feature_init(
         property_get_bool("vendor.audio.feature.external_dsp.enable",
-                           true));
+                           false));
     external_speaker_feature_init(
         property_get_bool("vendor.audio.feature.external_speaker.enable",
-                           true));
+                           false));
     external_speaker_tfa_feature_init(
         property_get_bool("vendor.audio.feature.external_speaker_tfa.enable",
                            false));
     hwdep_cal_feature_init(
         property_get_bool("vendor.audio.feature.hwdep_cal.enable",
-                           true));
+                           false));
+    #ifdef LINUX_ENABLED
+    #ifdef HFP_ENABLED
+        hfp_feature_init(true);
+    #else
+        hfp_feature_init(false);
+    #endif
+    #else
     hfp_feature_init(
         property_get_bool("vendor.audio.feature.hfp.enable",
-                           true));
+                            false));
+    #endif
+    icc_feature_init(
+        property_get_bool("vendor.audio.feature.icc.enable",
+                           false));
     ext_hw_plugin_feature_init(
         property_get_bool("vendor.audio.feature.ext_hw_plugin.enable",
                            false));
@@ -5575,7 +6677,7 @@ void audio_extn_feature_init()
                            false));
     concurrent_capture_feature_init(
         property_get_bool("vendor.audio.feature.concurrent_capture.enable",
-                           true));
+                           false));
     compress_in_feature_init(
         property_get_bool("vendor.audio.feature.compress_in.enable",
                            false));
@@ -5584,17 +6686,24 @@ void audio_extn_feature_init()
                            false));
     maxx_audio_feature_init(
         property_get_bool("vendor.audio.feature.maxx_audio.enable",
-                           true));
+                           false));
     audiozoom_feature_init(
         property_get_bool("vendor.audio.feature.audiozoom.enable",
-                           true));
+                           false));
+    auto_hal_feature_init(
+        property_get_bool("vendor.audio.feature.auto_hal.enable",
+                           false));
+    synth_feature_init(
+        property_get_bool("vendor.audio.feature.synth.enable",
+                       false));
+    power_policy_feature_init(
+        property_get_bool("vendor.audio.feature.powerpolicy.enable",
+                       false));
 }
 
 void audio_extn_set_parameters(struct audio_device *adev,
                                struct str_parms *parms)
 {
-   bool a2dp_reconfig = false;
-
    audio_extn_set_aanc_noise_level(adev, parms);
    audio_extn_set_anc_parameters(adev, parms);
    audio_extn_set_fluence_parameters(adev, parms);
@@ -5603,9 +6712,7 @@ void audio_extn_set_parameters(struct audio_device *adev,
    audio_extn_sound_trigger_set_parameters(adev, parms);
    audio_extn_listen_set_parameters(adev, parms);
    audio_extn_ssr_set_parameters(adev, parms);
-   audio_extn_hfp_set_parameters(adev, parms);
    audio_extn_dts_eagle_set_parameters(adev, parms);
-   audio_extn_a2dp_set_parameters(parms, &a2dp_reconfig);
    audio_extn_ddp_set_parameters(adev, parms);
    audio_extn_ds2_set_parameters(adev, parms);
    audio_extn_customstereo_set_parameters(adev, parms);
@@ -5624,6 +6731,8 @@ void audio_extn_set_parameters(struct audio_device *adev,
    audio_extn_set_aptx_dec_bt_addr(adev, parms);
    audio_extn_ffv_set_parameters(adev, parms);
    audio_extn_ext_hw_plugin_set_parameters(adev->ext_hw_plugin, parms);
+   audio_extn_icc_set_parameters(adev, parms);
+   audio_extn_synth_set_parameters(adev, parms);
 }
 
 void audio_extn_get_parameters(const struct audio_device *adev,

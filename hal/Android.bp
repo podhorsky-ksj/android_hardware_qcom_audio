@@ -31,6 +31,7 @@ target_board_platform_cc_library_shared {
         "audio_extn/audio_extn.c",
         "audio_extn/audio_hidl.cpp",
         "audio_extn/compress_in.c",
+        "audio_extn/device_utils.c",
         "audio_extn/fm.c",
         "audio_extn/keep_alive.c",
         "audio_extn/source_track.c",
@@ -40,10 +41,7 @@ target_board_platform_cc_library_shared {
         "msm8974/platform.c",
         "voice_extn/compress_voip.c",
         "voice_extn/voice_extn.c",
-    ] + select(soong_config_variable("qtiaudio", "feature_elliptic_ultrasound"), {
-        "true": ["audio_extn/ultrasound.c"],
-        default: [],
-    }) + select(soong_config_variable("qtiaudio", "feature_ext_amplifier"), {
+    ] + select(soong_config_variable("qtiaudio", "feature_ext_amplifier"), {
         "true": ["audio_extn/audio_amplifier.c"],
         default: [],
     }) + select(soong_config_variable("qtiaudio", "feature_gef_support"), {
@@ -56,12 +54,12 @@ target_board_platform_cc_library_shared {
 
     cflags: [
         "-Werror",
+        // The vendor kernel headers and Bionic both declare sched_param.
+        // The vendor kernel headers and Bionic both declare sched_param.
+        "-D_LINUX_SCHED_TYPES_H",
         "-D_GNU_SOURCE",
         "-DHW_VARIANTS_ENABLED",
-    ] + select(soong_config_variable("qtiaudio", "feature_elliptic_ultrasound"), {
-        "true": ["-DELLIPTIC_ULTRASOUND_ENABLED"],
-        default: [],
-    }) + select(soong_config_variable("qtiaudio", "feature_ext_amplifier"), {
+    ] + select(soong_config_variable("qtiaudio", "feature_ext_amplifier"), {
         "true": ["-DEXT_AMPLIFIER_ENABLED"],
         default: [],
     }) + select(soong_config_variable("qtiaudio", "feature_extended_compress_format"), {
@@ -70,6 +68,9 @@ target_board_platform_cc_library_shared {
     }) + select(soong_config_variable("qtiaudio", "feature_gef_support"), {
         "true": ["-DAUDIO_GENERIC_EFFECT_FRAMEWORK_ENABLED"],
         default: [],
+    }) + select(soong_config_variable("qtiaudio", "feature_gki"), {
+        "true": ["-DAUDIO_GKI_ENABLED"],
+        default: [],
     }) + select(soong_config_variable("qtiaudio", "feature_instance_id"), {
         "true": ["-DINSTANCE_ID_ENABLED"],
         default: [],
@@ -77,11 +78,6 @@ target_board_platform_cc_library_shared {
         "true": ["-DSOUND_TRIGGER_ENABLED"],
         default: [],
     }) + select(soong_config_variable("ANDROID", "target_board_platform"), {
-        "msm8998": [
-            "-DPLATFORM_MSM8998",
-            "-DMAX_TARGET_SPECIFIC_CHANNEL_CNT=8",
-            "-DSOUND_TRIGGER_PLATFORM_NAME=msm8998",
-        ],
         "sdm660": [
             "-DPLATFORM_MSMFALCON",
             "-DMAX_TARGET_SPECIFIC_CHANNEL_CNT=8",
@@ -130,4 +126,8 @@ target_board_platform_cc_library_shared {
         "true": ["libhardware"],
         default: [],
     }),
+
+    sanitize: {
+        integer_overflow: true,
+    },
 }

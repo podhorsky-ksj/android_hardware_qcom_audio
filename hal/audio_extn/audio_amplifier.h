@@ -39,14 +39,13 @@ int amplifier_set_input_devices(uint32_t devices);
 int amplifier_set_output_devices(uint32_t devices);
 int amplifier_enable_devices(uint32_t devices, bool enable);
 int amplifier_set_mode(audio_mode_t mode);
-int amplifier_output_stream_start(struct audio_stream_out *stream,
-        bool offload);
-int amplifier_input_stream_start(struct audio_stream_in *stream);
-int amplifier_output_stream_standby(struct audio_stream_out *stream);
-int amplifier_input_stream_standby(struct audio_stream_in *stream);
-int amplifier_set_parameters(struct str_parms *parms);
-int amplifier_out_set_parameters(struct str_parms *parms);
-int amplifier_in_set_parameters(struct str_parms *parms);
+int amplifier_output_stream_start(struct audio_stream_out* stream, bool offload);
+int amplifier_input_stream_start(struct audio_stream_in* stream);
+int amplifier_output_stream_standby(struct audio_stream_out* stream);
+int amplifier_input_stream_standby(struct audio_stream_in* stream);
+int amplifier_set_parameters(struct str_parms* parms);
+int amplifier_out_set_parameters(struct str_parms* parms);
+int amplifier_in_set_parameters(struct str_parms* parms);
 int amplifier_set_feedback(void* adev, uint32_t devices, bool enable);
 int amplifier_close(void);
 #endif

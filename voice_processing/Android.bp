@@ -26,4 +26,8 @@ cc_library_shared {
         "libdl",
         "liblog",
     ],
+
+    sanitize: {
+        integer_overflow: true,
+    },
 }

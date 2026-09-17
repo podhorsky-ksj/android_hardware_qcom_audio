@@ -33,4 +33,8 @@ cc_library_shared {
         "liblog",
         "libtinyalsa",
     ],
+
+    sanitize: {
+        integer_overflow: true,
+    },
 }

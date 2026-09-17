@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2014-2019 The Linux Foundation. All rights reserved.
+* Copyright (c) 2014-2021 The Linux Foundation. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions are
@@ -40,22 +40,9 @@
 #include "platform.h"
 #include "audio_hal_plugin.h"
 
-
-// - external function dependency -
-static fp_read_line_from_file_t fp_read_line_from_file;
-static fp_get_usecase_from_list_t fp_get_usecase_from_list;
-static fp_enable_disable_snd_device_t fp_disable_snd_device;
-static fp_enable_disable_snd_device_t  fp_enable_snd_device;
-static fp_enable_disable_audio_route_t fp_disable_audio_route;
-static fp_enable_disable_audio_route_t fp_enable_audio_route;
-static fp_platform_set_snd_device_backend_t fp_platform_set_snd_device_backend;
-static fp_platform_get_snd_device_name_extn_t fp_platform_get_snd_device_name_extn;
-static fp_platform_get_default_app_type_v2_t fp_platform_get_default_app_type_v2;
-static fp_platform_send_audio_calibration_t fp_platform_send_audio_calibration;
-
-fp_audio_route_apply_and_update_path_t fp_audio_route_apply_and_update_path;
-
-#ifdef EXT_HW_PLUGIN_ENABLED
+//external feature dependency
+static fp_b64decode_t fp_b64decode;
+static fp_b64encode_t fp_b64encode;
 
 typedef int32_t (*audio_hal_plugin_init_t)(void);
 typedef int32_t (*audio_hal_plugin_deinit_t)(void);
@@ -75,7 +62,11 @@ struct ext_hw_plugin_data {
 };
 
 /* This can be defined in platform specific file or use compile flag */
+#ifdef DAEMON_SUPPORT_AUTO
+#define LIB_PLUGIN_DRIVER "libaudiohalpluginclient.so"
+#else
 #define LIB_PLUGIN_DRIVER "libaudiohalplugin.so"
+#endif
 
 void* ext_hw_plugin_init(struct audio_device *adev, ext_hw_plugin_init_config_t init_config)
 {
@@ -90,7 +81,9 @@ void* ext_hw_plugin_init(struct audio_device *adev, ext_hw_plugin_init_config_t 
     }
 
     my_plugin->adev = adev;
-    fp_audio_route_apply_and_update_path = init_config.fp_audio_route_apply_and_update_path;
+
+    fp_b64decode = init_config.fp_b64decode;
+    fp_b64encode = init_config.fp_b64encode;
 
     my_plugin->plugin_handle = dlopen(LIB_PLUGIN_DRIVER, RTLD_NOW);
     if (my_plugin->plugin_handle == NULL) {
@@ -189,10 +182,13 @@ static int32_t ext_hw_plugin_check_plugin_usecase(audio_usecase_t hal_usecase,
     case USECASE_AUDIO_RECORD_COMPRESS:
     case USECASE_AUDIO_RECORD_LOW_LATENCY:
     case USECASE_AUDIO_RECORD_FM_VIRTUAL:
+    case USECASE_AUDIO_RECORD_ECHO_REF_EXT:
         *plugin_usecase = AUDIO_HAL_PLUGIN_USECASE_DEFAULT_CAPTURE;
         break;
     case USECASE_AUDIO_HFP_SCO:
     case USECASE_AUDIO_HFP_SCO_WB:
+    case USECASE_AUDIO_HFP_SCO_DOWNLINK:
+    case USECASE_AUDIO_HFP_SCO_WB_DOWNLINK:
         *plugin_usecase = AUDIO_HAL_PLUGIN_USECASE_HFP_VOICE_CALL;
         break;
     case USECASE_VOICE_CALL:
@@ -207,6 +203,9 @@ static int32_t ext_hw_plugin_check_plugin_usecase(audio_usecase_t hal_usecase,
         break;
     case USECASE_AUDIO_FM_TUNER_EXT:
        *plugin_usecase = AUDIO_HAL_PLUGIN_USECASE_FM_TUNER;
+        break;
+    case USECASE_ICC_CALL:
+        *plugin_usecase = AUDIO_HAL_PLUGIN_USECASE_ICC;
         break;
     default:
         ret = -EINVAL;
@@ -251,7 +250,7 @@ int32_t ext_hw_plugin_usecase_start(void *plugin, struct audio_usecase *usecase)
 
         if (((usecase->type == PCM_CAPTURE) || (usecase->type == VOICE_CALL) ||
               (usecase->type == VOIP_CALL) || (usecase->type == PCM_HFP_CALL) ||
-              (usecase->type == PCM_PASSTHROUGH)) &&
+              (usecase->type == ICC_CALL) || (usecase->type == PCM_PASSTHROUGH)) &&
             (usecase->in_snd_device != SND_DEVICE_NONE)) {
             codec_enable.snd_dev = usecase->in_snd_device;
             /* TODO - below should be related with in_snd_dev */
@@ -295,9 +294,12 @@ int32_t ext_hw_plugin_usecase_start(void *plugin, struct audio_usecase *usecase)
             }
         }
 
-        if ((usecase->type == PCM_CAPTURE) &&
-            (usecase->id ==  USECASE_AUDIO_RECORD) &&
-            (usecase->in_snd_device == SND_DEVICE_IN_SPEAKER_QMIC_AEC)) {
+        if (((usecase->type == PCM_CAPTURE) &&
+            (usecase->id == USECASE_AUDIO_RECORD) &&
+            (usecase->in_snd_device == SND_DEVICE_IN_SPEAKER_QMIC_AEC)) ||
+            ((usecase->type == PCM_HFP_CALL) &&
+            ((usecase->id == USECASE_AUDIO_HFP_SCO) || (usecase->id == USECASE_AUDIO_HFP_SCO_WB)) &&
+            (usecase->in_snd_device == SND_DEVICE_IN_VOICE_SPEAKER_MIC_HFP_MMSECNS))) {
             audio_hal_plugin_codec_enable_t codec_enable_ec = {0,};
             codec_enable_ec.snd_dev = usecase->in_snd_device;
             // TODO - below should be related with in_snd_dev
@@ -322,8 +324,8 @@ int32_t ext_hw_plugin_usecase_start(void *plugin, struct audio_usecase *usecase)
         }
 
         if (((usecase->type == PCM_PLAYBACK) || (usecase->type == VOICE_CALL) ||
-                (usecase->type == VOIP_CALL) || (usecase->type == PCM_HFP_CALL)) &&
-            (usecase->out_snd_device != SND_DEVICE_NONE)) {
+                (usecase->type == VOIP_CALL) || (usecase->type == PCM_HFP_CALL) ||
+                (usecase->type == ICC_CALL)) && (usecase->out_snd_device != SND_DEVICE_NONE)) {
             codec_enable.snd_dev = usecase->out_snd_device;
             /* TODO - below should be related with out_snd_dev */
             codec_enable.sample_rate = 48000;
@@ -390,8 +392,8 @@ int32_t ext_hw_plugin_usecase_stop(void *plugin, struct audio_usecase *usecase)
         }
 
         if (((usecase->type == PCM_PLAYBACK) || (usecase->type == VOICE_CALL) ||
-                (usecase->type == VOIP_CALL) || (usecase->type == PCM_HFP_CALL)) &&
-            (usecase->out_snd_device != SND_DEVICE_NONE)) {
+                (usecase->type == VOIP_CALL) || (usecase->type == PCM_HFP_CALL) ||
+                (usecase->type == ICC_CALL)) && (usecase->out_snd_device != SND_DEVICE_NONE)) {
             codec_disable.snd_dev = usecase->out_snd_device;
 
             ALOGD("%s: disable audio hal plugin output, %d, %d",
@@ -407,7 +409,7 @@ int32_t ext_hw_plugin_usecase_stop(void *plugin, struct audio_usecase *usecase)
         }
         if (((usecase->type == PCM_CAPTURE) || (usecase->type == VOICE_CALL) ||
              (usecase->type == VOIP_CALL) || (usecase->type == PCM_HFP_CALL) ||
-             (usecase->type == PCM_PASSTHROUGH)) &&
+             (usecase->type == PCM_PASSTHROUGH) || (usecase->type == ICC_CALL)) &&
             (usecase->in_snd_device != SND_DEVICE_NONE)) {
             codec_disable.snd_dev = usecase->in_snd_device;
 
@@ -469,7 +471,7 @@ static int32_t ext_hw_plugin_string_to_dword(char *string_value, void **dword_pt
         ALOGE("%s: memory allocation failed", __func__);
         return -ENOMEM;
     }
-    dlen = b64decode(string_value, strlen(string_value), dptr);
+    dlen = fp_b64decode(string_value, strlen(string_value), dptr);
     if ((dlen <= 0) || ((uint32_t)dlen != 4*dword_len)){
         ALOGE("%s: data decoding failed", __func__);
         ret = -EINVAL;
@@ -536,7 +538,7 @@ static int32_t ext_hw_plugin_dword_to_string(uint32_t *dword_ptr, uint32_t dword
         goto done_dword_to_string;
     }
 
-    ret = b64encode(dptr, dlen, outptr);
+    ret = fp_b64encode(dptr, dlen, outptr);
     if(ret < 0) {
         ALOGE("[%s] failed to convert data to string ret = %d", __func__, ret);
         free(outptr);
@@ -584,6 +586,11 @@ int32_t ext_hw_plugin_set_parameters(void *plugin, struct str_parms *parms)
     if(val == AUDIO_HAL_PLUGIN_MSG_CODEC_TUNNEL_CMD ||
         val == AUDIO_HAL_PLUGIN_MSG_CODEC_SET_PP_EQ) {
         kv_pairs = str_parms_to_str(parms);
+        if (kv_pairs == NULL) {
+            ret = -EINVAL;
+            ALOGE("%s: key-value pair is NULL", __func__);
+            goto done;
+        }
         len = strlen(kv_pairs);
         value = (char*)calloc(len, sizeof(char));
         if (value == NULL) {
@@ -1033,6 +1040,11 @@ int ext_hw_plugin_get_parameters(void *plugin,
 
     if(val == AUDIO_HAL_PLUGIN_MSG_CODEC_TUNNEL_GET_CMD) {
         kv_pairs = str_parms_to_str(query);
+        if (kv_pairs == NULL) {
+            ret = -EINVAL;
+            ALOGE("%s: key-value pair is NULL", __func__);
+            goto done_get_param;
+        }
         len = strlen(kv_pairs);
         value = (char*)calloc(len, sizeof(char));
         if (value == NULL) {
@@ -1568,4 +1580,3 @@ int ext_hw_plugin_set_audio_gain(void *plugin,
     }
     return ret;
 }
-#endif /* EXT_HW_PLUGIN_ENABLED */

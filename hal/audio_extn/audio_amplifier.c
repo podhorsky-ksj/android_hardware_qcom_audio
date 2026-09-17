@@ -16,39 +16,35 @@
 
 #define LOG_TAG "audio_amplifier"
 
+#include <log/log.h>
+#include <dlfcn.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <dlfcn.h>
-#include <log/log.h>
 
 #include "audio_hw.h"
 #include "platform.h"
 
 struct amplifier_data {
-    struct audio_device *adev;
-    amplifier_device_t *hw;
+    struct audio_device* adev;
+    amplifier_device_t* hw;
 };
 
 struct amplifier_data amp;
 
-int amplifier_open(void* adev)
-{
+int amplifier_open(void* adev) {
     int rc;
-    amplifier_module_t *module;
-    amp.adev = (struct audio_device *)adev;
+    amplifier_module_t* module;
+    amp.adev = (struct audio_device*)adev;
 
-    rc = hw_get_module(AMPLIFIER_HARDWARE_MODULE_ID,
-            (const hw_module_t **) &module);
+    rc = hw_get_module(AMPLIFIER_HARDWARE_MODULE_ID, (const hw_module_t**)&module);
     if (rc) {
-        ALOGV("%s: Failed to obtain reference to amplifier module: %s\n",
-                __func__, strerror(-rc));
+        ALOGV("%s: Failed to obtain reference to amplifier module: %s\n", __func__, strerror(-rc));
         return -ENODEV;
     }
 
-    rc = amplifier_device_open((const hw_module_t *) module, &amp.hw);
+    rc = amplifier_device_open((const hw_module_t*)module, &amp.hw);
     if (rc) {
-        ALOGV("%s: Failed to open amplifier hardware device: %s\n",
-                __func__, strerror(-rc));
+        ALOGV("%s: Failed to open amplifier hardware device: %s\n", __func__, strerror(-rc));
         amp.hw = NULL;
 
         return -ENODEV;
@@ -64,24 +60,19 @@ int amplifier_open(void* adev)
     return 0;
 }
 
-int amplifier_set_input_devices(uint32_t devices)
-{
-    if (amp.hw && amp.hw->set_input_devices)
-        return amp.hw->set_input_devices(amp.hw, devices);
+int amplifier_set_input_devices(uint32_t devices) {
+    if (amp.hw && amp.hw->set_input_devices) return amp.hw->set_input_devices(amp.hw, devices);
 
     return 0;
 }
 
-int amplifier_set_output_devices(uint32_t devices)
-{
-    if (amp.hw && amp.hw->set_output_devices)
-        return amp.hw->set_output_devices(amp.hw, devices);
+int amplifier_set_output_devices(uint32_t devices) {
+    if (amp.hw && amp.hw->set_output_devices) return amp.hw->set_output_devices(amp.hw, devices);
 
     return 0;
 }
 
-int amplifier_enable_devices(uint32_t devices, bool enable)
-{
+int amplifier_enable_devices(uint32_t devices, bool enable) {
     bool is_output = devices < SND_DEVICE_OUT_END;
 
     if (amp.hw && amp.hw->enable_output_devices && is_output)
@@ -93,83 +84,65 @@ int amplifier_enable_devices(uint32_t devices, bool enable)
     return 0;
 }
 
-int amplifier_set_mode(audio_mode_t mode)
-{
-    if (amp.hw && amp.hw->set_mode)
-        return amp.hw->set_mode(amp.hw, mode);
+int amplifier_set_mode(audio_mode_t mode) {
+    if (amp.hw && amp.hw->set_mode) return amp.hw->set_mode(amp.hw, mode);
 
     return 0;
 }
 
-int amplifier_output_stream_start(struct audio_stream_out *stream,
-        bool offload)
-{
+int amplifier_output_stream_start(struct audio_stream_out* stream, bool offload) {
     if (amp.hw && amp.hw->output_stream_start)
         return amp.hw->output_stream_start(amp.hw, stream, offload);
 
     return 0;
 }
 
-int amplifier_input_stream_start(struct audio_stream_in *stream)
-{
-    if (amp.hw && amp.hw->input_stream_start)
-        return amp.hw->input_stream_start(amp.hw, stream);
+int amplifier_input_stream_start(struct audio_stream_in* stream) {
+    if (amp.hw && amp.hw->input_stream_start) return amp.hw->input_stream_start(amp.hw, stream);
 
     return 0;
 }
 
-int amplifier_output_stream_standby(struct audio_stream_out *stream)
-{
+int amplifier_output_stream_standby(struct audio_stream_out* stream) {
     if (amp.hw && amp.hw->output_stream_standby)
         return amp.hw->output_stream_standby(amp.hw, stream);
 
     return 0;
 }
 
-int amplifier_input_stream_standby(struct audio_stream_in *stream)
-{
-    if (amp.hw && amp.hw->input_stream_standby)
-        return amp.hw->input_stream_standby(amp.hw, stream);
+int amplifier_input_stream_standby(struct audio_stream_in* stream) {
+    if (amp.hw && amp.hw->input_stream_standby) return amp.hw->input_stream_standby(amp.hw, stream);
 
     return 0;
 }
 
-int amplifier_set_parameters(struct str_parms *parms)
-{
-    if (amp.hw && amp.hw->set_parameters)
-        return amp.hw->set_parameters(amp.hw, parms);
+int amplifier_set_parameters(struct str_parms* parms) {
+    if (amp.hw && amp.hw->set_parameters) return amp.hw->set_parameters(amp.hw, parms);
 
     return 0;
 }
 
-int amplifier_out_set_parameters(struct str_parms *parms)
-{
-    if (amp.hw && amp.hw->out_set_parameters)
-        return amp.hw->out_set_parameters(amp.hw, parms);
+int amplifier_out_set_parameters(struct str_parms* parms) {
+    if (amp.hw && amp.hw->out_set_parameters) return amp.hw->out_set_parameters(amp.hw, parms);
 
     return 0;
 }
 
-int amplifier_in_set_parameters(struct str_parms *parms)
-{
-    if (amp.hw && amp.hw->in_set_parameters)
-        return amp.hw->in_set_parameters(amp.hw, parms);
+int amplifier_in_set_parameters(struct str_parms* parms) {
+    if (amp.hw && amp.hw->in_set_parameters) return amp.hw->in_set_parameters(amp.hw, parms);
 
     return 0;
 }
 
-int amplifier_set_feedback(void* adev, uint32_t devices, bool enable)
-{
+int amplifier_set_feedback(void* adev, uint32_t devices, bool enable) {
     amp.adev = (struct audio_device*)adev;
     if (amp.hw && amp.hw->set_feedback)
         return amp.hw->set_feedback(amp.hw, amp.adev, devices, enable);
     return 0;
 }
 
-int amplifier_close(void)
-{
-    if (amp.hw)
-        amplifier_device_close(amp.hw);
+int amplifier_close(void) {
+    if (amp.hw) amplifier_device_close(amp.hw);
 
     amp.hw = NULL;
 
